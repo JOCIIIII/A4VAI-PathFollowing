@@ -1,0 +1,107 @@
+############################################################
+#
+#   - Name : sim.yaml
+#
+#                                 - KAIST FDCL, 2026.03.11
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    vehicle_type: 1
+    # 1: quad, 2: octa
+
+    guid_type: 2
+    # 0: Pos. Ctrl, 1: MPPI-GL (original cost), 2: MPPI-GL (cruise speed control)
+    
+    wp_type: 7
+    # 0: path planning solution, 1: straight line, 2: rectangle
+    # 3: zigzag, 4: circle, 5: figure-8
+    # 6: Alt change, 7: Spiral, 8: Lissajous curve (figure 8)
+
+    path_following:
+      dt_pf: 0.004
+      desired_speed: 3.0
+      lookahead_distance: 4.5
+      waypoint_switch_distance: 4.5
+
+      # guid type = 0
+      kp_vel: 1.0
+      kd_vel: 0.0
+
+      # legacy speed-guidance params (currently unused in core)
+      kp_speed: 3.0
+      kd_speed: 0.0
+      guid_eta: 2.0
+
+      # guidance transition / geometry tuning
+      final_wp_tolerance_m: 0.5
+      transition_speed_threshold_mps: 1.0
+      position_kp: 0.5
+      position_kv_multiplier: 3.0
+      min_guid_eta: 0.5
+      gl_vertical_speed_gain: 2.0
+
+    # guid type = 1,2
+    mppi:
+      dt_mppi: 0.05
+      num_samples: 512
+      horizon_steps: 100
+      cost_min_v_aligned: 0.3
+      use_gpr_forecast: true
+
+      # rollout tuning
+      type2_gamma_scale: 0.05
+      disturbance_var_weight_gain: 40.0
+      disturbance_var_clip: 5.0e-4
+      cost_path_error_scale_m: 5.0
+      gpr_var_bias: 1.0e-2
+      gpr_var_clip: 1.0
+
+      # guid type = 1
+      type_1:
+        state_cost: [0.01, 0.01, 0.01]      # Q
+        terminal_cost: [0.05, 0.05, 0.05]   # P
+        noise_std_u0_scale: 0.7
+        noise_std_u1_scale: 0.7
+        lambda_weight: 0.000245
+        u0_init: 0.5
+        u1_init: 2.0
+
+      # guid type = 2
+      type_2:
+        state_cost: [75.0, 50.0, 5.0]       # Q
+        terminal_cost: [0.0, 50.0, 5.0]     # P
+        noise_std_u0_scale: 0.04472135955
+        noise_std_u1_scale: 0.08944271910
+        lambda_weight: 0.1
+        u0_init: 0.0
+        u1_init: 2.0
+
+
+    ndo:
+      gain: [5.0, 5.0, 5.0]
+
+    numerics:
+      eps: 1.0e-9
+
+    gpr:
+      dt_gpr: 0.01
+      dt_gpr_opt_mul: 20
+      forecast_steps: 2000
+
+      measurement_matrix: [1.0, 0.0]
+
+      meas_noise_var_x: 1.0e-6
+      meas_noise_var_y: 1.0e-6
+
+      hyp_l_init: [1.0, 1.0]
+      hyp_q_init: [1.0, 1.0]
+      hyp_n: 500
+
+      hyp_l_min: 1.0e-2
+      hyp_l_max: 0.5
+      hyp_q_min: 1.0e-2
+      hyp_q_max: 0.5
+
+      lpf_cutoff_hz: 5

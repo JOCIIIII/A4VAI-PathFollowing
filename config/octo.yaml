@@ -1,0 +1,49 @@
+############################################################
+#
+#   - Name : octo.yaml
+#
+#                                 - KAIST FDCL, 2026.03.11
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    model:
+      mass: 10.4
+      Ixx: 0.603079
+      Iyy: 0.750835
+      Izz: 1.005022
+      gravity: 9.81
+
+    actuator:
+      n_motor: 8
+      max_thrust_per_rotor: 117.48375
+      # torque_coefficient: 0.02
+      # thrust_coefficient: 1.0
+      rotor_positions:
+        - [ 0.52,  0.22, 0]
+        - [ 0.22,  0.52, 0]
+        - [-0.22,  0.52, 0]
+        - [-0.52,  0.22, 0]
+        - [-0.52, -0.22, 0]
+        - [-0.22, -0.52, 0]
+        - [ 0.22, -0.52, 0]
+        - [ 0.52, -0.22, 0]
+      spin_direction: [1, 1, -1, -1, -1, -1, 1, 1]
+      
+    px4_model:
+      max_tilt_deg: 30.0
+      max_accel_xy: 4.0
+      max_accel_z: 2.5      
+      tau_phi: 0.3
+      tau_the: 0.3
+      tau_psi: 0.6
+      del_psi_cmd_limit_deg: 20.0
+      tau_wb: 0.05
+      tau_p: 0.1
+      tau_q: 0.1
+      tau_r: 0.2
+      alpha_p: 0.1
+      alpha_q: 0.1
+      alpha_r: 0.1
+      tau_throttle: 0.01875

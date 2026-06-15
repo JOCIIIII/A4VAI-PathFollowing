@@ -460,6 +460,55 @@ def test_mppi_input_payload_validation() -> None:
     mppi.close()
 
 
+def test_replan_waypoint_update_relocalizes_without_reset() -> None:
+    att = PathFollowingCore(
+        guid_type=0,
+        wp_type=0,
+        vehicle_cfg=_vehicle_cfg(),
+        sim_cfg=_sim_cfg(),
+        logger_obj=None,
+    )
+    att.update_heartbeats(True, True, True)
+
+    # First path: full reset snaps tracking to the start.
+    att.update_waypoints(
+        False,
+        [0.0, 20.0, 40.0, 60.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [10.0, 10.0, 10.0, 10.0],
+    )
+    assert att.path.passed_index == 0
+    assert att.path.heading_index == 1
+
+    # Fly forward and hold at x=30 (on segment [20, 40]) so tracking advances.
+    for i in range(40):
+        _update_att_sensor(att, i, x=min(float(i), 30.0), vx=8.0)
+        out = att.update()
+        assert out is not None
+    assert att.path.passed_index >= 1
+
+    # Stand in for converged NDO/MPPI state to detect an unwanted forced reset.
+    att.mppi.reset_flag = 0
+    att.ndo.disturbance_acc_ned[:] = [1.0, 2.0, 3.0]
+
+    # Replan: a fresh waypoint stream arrives mid-flight.
+    att.update_waypoints(
+        False,
+        [0.0, 20.0, 40.0, 60.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [10.0, 10.0, 10.0, 10.0],
+    )
+
+    # Must NOT snap back to the start; must re-localize to the segment that
+    # contains the current position (x=30 -> segment [20, 40]).
+    assert att.path.passed_index == 1
+    assert att.path.heading_index == 2
+
+    # NDO / MPPI state preserved (no forced reset on a live replan update).
+    assert att.mppi.reset_flag == 0
+    assert (att.ndo.disturbance_acc_ned == np.array([1.0, 2.0, 3.0])).all()
+
+
 def test_att_core_without_drag_coeff_is_allowed() -> None:
     vehicle = _vehicle_cfg()
     PathFollowingCore(

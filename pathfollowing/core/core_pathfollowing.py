@@ -610,11 +610,21 @@ class PathFollowingCore:
             waypoints_ned = build_waypoints(self.wp_type)
             should_reset_tracking = True
 
-        if waypoints_ned is not None:
+        if waypoints_ned is not None and should_reset_tracking:
+            # Distinguish first-time setup from an in-flight replan update.
+            # Once following is underway (path.initialized) and a path already
+            # exists, a fresh waypoint stream is a replan: keep NDO/MPPI/guidance
+            # state and just re-localize tracking indices onto the new path
+            # (MPPI-style smooth update). Only the very first path does a full
+            # reset that snaps tracking to the start.
+            is_live_update = self.path.initialized and (self.path.waypoints_ned is not None)
+
             self.path.waypoints_ned = waypoints_ned
             self.path.ready = True
 
-            if should_reset_tracking:
+            if is_live_update:
+                self._relocalize_on_path(waypoints_ned)
+            else:
                 self._reset_path_tracking_state(waypoints_ned)
                 self.ndo.observer_state_ned[:] = 0.0
                 self.ndo.disturbance_acc_ned[:] = 0.0
@@ -868,6 +878,64 @@ class PathFollowingCore:
         self.path.interrupt_active = 0
         self.path.interrupt_prev = 0
         self.path.stop_flag = 0
+
+    def _relocalize_on_path(self, waypoints_ned: np.ndarray) -> None:
+        """Re-localize tracking onto a freshly updated (replanned) path.
+
+        Unlike _reset_path_tracking_state(), this is used while following is
+        already underway. It preserves NDO/MPPI solver state and the runtime
+        flags (interrupt/stop), and recovers passed/heading indices by
+        re-projecting the current vehicle position onto the new path. This lets
+        a continuously replanned waypoint stream be followed without snapping
+        back to the start each time.
+        """
+        num_waypoints = int(waypoints_ned.shape[0])
+        if num_waypoints < 2:
+            raise RuntimeError("[FATAL] path following requires at least 2 waypoints.")
+
+        position_ned = self.state.position_ned
+        eps = self.cfg.numerics.eps
+
+        best_dist = math.inf
+        best_seg_start = 0
+        best_point = waypoints_ned[0].copy()
+
+        # Search every segment of the new path (full re-localization), since the
+        # incoming path's index frame is unrelated to the previous one.
+        for seg_start in range(num_waypoints - 1):
+            segment_vec = waypoints_ned[seg_start + 1] - waypoints_ned[seg_start]
+            segment_len = np.linalg.norm(segment_vec)
+            vec_to_vehicle = position_ned - waypoints_ned[seg_start]
+
+            projection_len = min(
+                max(np.dot(segment_vec, vec_to_vehicle) / max(segment_len, eps), 0.0),
+                segment_len,
+            )
+            point_on_segment = (
+                waypoints_ned[seg_start] + projection_len * segment_vec / max(segment_len, eps)
+            )
+            distance_to_segment = np.linalg.norm(point_on_segment - position_ned)
+
+            if distance_to_segment < best_dist:
+                best_dist = float(distance_to_segment)
+                best_seg_start = int(seg_start)
+                best_point = point_on_segment
+
+        self.path.passed_index = int(best_seg_start)
+        self.path.heading_index = int(min(best_seg_start + 1, num_waypoints - 1))
+        self.path.closest_index = int(best_seg_start)
+        self.path.closest_point_ned[:] = best_point
+        self.path.virtual_target_ned[:] = waypoints_ned[self.path.heading_index]
+
+        self.path.cross_track_error = float(best_dist)
+        self.path.distance_to_heading_wp = float(
+            np.linalg.norm(waypoints_ned[self.path.heading_index] - position_ned)
+        )
+        self.path.distance_to_goal = float(np.linalg.norm(waypoints_ned[-1] - position_ned))
+
+        # A new path means the previous completion no longer holds; resume.
+        self.path.pf_done = False
+        self.path.plot_complete = False
 
     # =====================================================
     # legacy path-following geometry helpers

@@ -43,6 +43,12 @@ class NodePathFollowing(Node):
         self.declare_parameter('guid_type')
         self.declare_parameter('wp_type')
 
+        # RealGazebo 는 차량을 vehicle{id+1} 네임스페이스로 띄운다 (예: /vehicle1/fmu/...).
+        # px4_ns 파라미터로 PX4 출력 토픽 접두사를 지정한다 (기본 '' = 네임스페이스 없음).
+        self.declare_parameter('px4_ns', '')
+        px4_ns = self.get_parameter('px4_ns').get_parameter_value().string_value
+        px4_ns = px4_ns.rstrip('/')
+
         vehicle_type = self._require_int(
             'vehicle_type',
             allowed={1, 2},
@@ -115,28 +121,28 @@ class NodePathFollowing(Node):
 
         self.vehicle_local_position_subscription = self.create_subscription(
             VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
+            f'{px4_ns}/fmu/out/vehicle_local_position',
             self._vehicle_local_position_callback,
             qos_profile_sensor_data,
         )
 
         self.vehicle_attitude_subscription = self.create_subscription(
             VehicleAttitude,
-            '/fmu/out/vehicle_attitude',
+            f'{px4_ns}/fmu/out/vehicle_attitude',
             self._vehicle_attitude_callback,
             qos_profile_sensor_data,
         )
 
         self.vehicle_acceleration_subscription = self.create_subscription(
             VehicleAcceleration,
-            '/fmu/out/vehicle_acceleration',
+            f'{px4_ns}/fmu/out/vehicle_acceleration',
             self._vehicle_acceleration_callback,
             qos_profile_sensor_data,
         )
 
         self.timesync_status_subscription = self.create_subscription(
             TimesyncStatus,
-            '/fmu/out/timesync_status',
+            f'{px4_ns}/fmu/out/timesync_status',
             self._timesync_status_callback,
             qos_profile_sensor_data,
         )

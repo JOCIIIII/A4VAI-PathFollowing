@@ -571,6 +571,11 @@ class MPPICore:
         self.gpu_disturbance_acc_var = None
         self.gpu_stk = None
 
+        # ★ desired_speed 런타임 override (외부 /desired_speed 토픽 or 학습 신경망).
+        #   None 이면 config 값(self.cfg.path_following.desired_speed) 사용 = 기존 동작.
+        #   값이 있으면 host_update[13] 에 그 값을 넣어 MPPI cruise 목표속도를 동적 갱신.
+        self.desired_speed_override = None
+
         # Preallocated host buffers (set in _build_cuda_solver).
         self.host_const = None
         self.host_update = None
@@ -981,7 +986,11 @@ class MPPICore:
         self.host_update[10] = float(self.vehicle_state.euler_rpy[1])
         self.host_update[11] = float(self.vehicle_state.euler_rpy[2])
         self.host_update[12] = float(self.vehicle_state.thrust_cmd)
-        self.host_update[13] = float(self.cfg.path_following.desired_speed)
+        # ★ override 있으면 그 값(동적 desired_speed), 없으면 config 기본값.
+        _des_spd = (self.desired_speed_override
+                    if self.desired_speed_override is not None
+                    else self.cfg.path_following.desired_speed)
+        self.host_update[13] = float(_des_spd)
         self.host_update[14] = float(self.cfg.path_following.lookahead_distance)
 
         cuda.memcpy_htod(self.gpu_u0, self.u0)

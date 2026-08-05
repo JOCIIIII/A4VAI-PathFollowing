@@ -21,7 +21,7 @@ node_pathfollowing:
 
     path_following:
       dt_pf: 0.004
-      desired_speed: 3.0
+      desired_speed: 1.5
       lookahead_distance: 4.5
       waypoint_switch_distance: 4.5
 

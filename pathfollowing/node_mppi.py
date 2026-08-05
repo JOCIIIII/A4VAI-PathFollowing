@@ -15,7 +15,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
 
-from std_msgs.msg import Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Float32, Float32MultiArray, Int32MultiArray
 
 from .core.core_mppi import MPPICore
 
@@ -76,6 +76,15 @@ class NodeMPPI(Node):
             Float32MultiArray,
             'GPR/in/disturbance_acc',
             self._gpr_disturbance_acc_callback,
+            qos_profile_sensor_data,
+        )
+
+        # ★ 동적 desired_speed override (/desired_speed). 학습 속도 신경망(speed_policy_node)
+        #   또는 수동 pub 이 목표 순항속도를 실시간 갱신. 안 오면 config 기본값 사용.
+        self.desired_speed_subscription = self.create_subscription(
+            Float32,
+            '/desired_speed',
+            self._desired_speed_callback,
             qos_profile_sensor_data,
         )
 
@@ -180,6 +189,12 @@ class NodeMPPI(Node):
 
     def _gpr_disturbance_acc_callback(self, msg: Float32MultiArray) -> None:
         self.core.update_disturbance_acc(msg.data)
+
+    def _desired_speed_callback(self, msg: Float32) -> None:
+        # 음수/비정상은 무시(안전). 유효값이면 MPPI cruise 목표속도 override.
+        v = float(msg.data)
+        if v >= 0.0:
+            self.core.desired_speed_override = v
 
     # =====================================================
     # timer callbacks

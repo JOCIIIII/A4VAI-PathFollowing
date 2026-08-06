@@ -14,7 +14,7 @@ node_pathfollowing:
     guid_type: 2
     # 0: Pos. Ctrl, 1: MPPI-GL (original cost), 2: MPPI-GL (cruise speed control)
     
-    wp_type: 7
+    wp_type: 0
     # 0: path planning solution, 1: straight line, 2: rectangle
     # 3: zigzag, 4: circle, 5: figure-8
     # 6: Alt change, 7: Spiral, 8: Lissajous curve (figure 8)

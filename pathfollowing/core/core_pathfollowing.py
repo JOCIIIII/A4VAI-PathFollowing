@@ -21,6 +21,8 @@ from ..utils.math_utils import (
     dcm_from_euler321,
 )
 
+PX4_NAVIGATION_STATE_OFFBOARD = 14
+
 
 def _require_sections(cfg: dict[str, Any], required: tuple[str, ...], scope: str) -> None:
     missing = [k for k in required if k not in cfg]
@@ -230,9 +232,51 @@ class GuidanceTuningConfig:
 
 
 @dataclass
+class DesiredSpeedRampConfig:
+    enabled: bool
+    min_mps: float
+    slope_mps2: float
+    tracking_margin_mps: float
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any], target_speed: float) -> "DesiredSpeedRampConfig":
+        ramp_cfg = cfg.get("desired_speed_ramp")
+        if ramp_cfg is None:
+            return cls(
+                enabled=False,
+                min_mps=float(target_speed),
+                slope_mps2=0.0,
+                tracking_margin_mps=0.0,
+            )
+        if not isinstance(ramp_cfg, dict):
+            raise RuntimeError("[FATAL] path_following.desired_speed_ramp must be a mapping.")
+
+        enabled = bool(ramp_cfg.get("enabled", False))
+        min_mps = float(ramp_cfg.get("min_mps", target_speed))
+        slope_mps2 = float(ramp_cfg.get("slope_mps2", 0.0))
+        tracking_margin_mps = float(ramp_cfg.get("tracking_margin_mps", 0.0))
+        if min_mps < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.min_mps must be >= 0.")
+        if enabled and slope_mps2 <= 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.slope_mps2 must be > 0.")
+        if not enabled and slope_mps2 < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.slope_mps2 must be >= 0.")
+        if tracking_margin_mps < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.tracking_margin_mps must be >= 0.")
+
+        return cls(
+            enabled=enabled,
+            min_mps=min_mps,
+            slope_mps2=slope_mps2,
+            tracking_margin_mps=tracking_margin_mps,
+        )
+
+
+@dataclass
 class PathFollowingConfig:
     dt_pf: float
     desired_speed: float
+    desired_speed_ramp: DesiredSpeedRampConfig
     lookahead_distance: float
     waypoint_switch_distance: float
 
@@ -263,6 +307,7 @@ class PathFollowingConfig:
         )
         dt_pf = float(cfg["dt_pf"])
         desired_speed = float(cfg["desired_speed"])
+        desired_speed_ramp = DesiredSpeedRampConfig.from_dict(cfg, desired_speed)
         lookahead_distance = float(cfg["lookahead_distance"])
         waypoint_switch_distance = float(cfg["waypoint_switch_distance"])
         if dt_pf <= 0.0 or desired_speed < 0.0 or lookahead_distance <= 0.0 or waypoint_switch_distance <= 0.0:
@@ -279,6 +324,7 @@ class PathFollowingConfig:
         return cls(
             dt_pf=dt_pf,
             desired_speed=desired_speed,
+            desired_speed_ramp=desired_speed_ramp,
             lookahead_distance=lookahead_distance,
             waypoint_switch_distance=waypoint_switch_distance,
             kp_vel=float(cfg["kp_vel"]),
@@ -521,12 +567,22 @@ class PathFollowingCore:
         self.mppi = MPPIState()
         self.ndo = NDOState()
         self.att_cmd = AttitudeCommand()
+        self.desired_speed_cruise = float(self.cfg.path_following.desired_speed)
+        self.desired_speed_target = float(self.desired_speed_cruise)
+        if self.cfg.path_following.desired_speed_ramp.enabled:
+            self.desired_speed = float(self.cfg.path_following.desired_speed_ramp.min_mps)
+        else:
+            self.desired_speed = float(self.desired_speed_target)
         # Legacy node initialized thrust command with 9.81.
         self.att_cmd.total_thrust_cmd = float(self.cfg.model.gravity)
 
         self.controller_heartbeat = False
         self.path_planning_heartbeat = False
         self.collision_avoidance_heartbeat = False
+        self.vehicle_arming_state = -1
+        self.vehicle_nav_state = -1
+        self.vehicle_is_armed = False
+        self._desired_speed_ramp_started = False
 
         self._time_initialized = False
         self._time0 = 0.0
@@ -558,6 +614,39 @@ class PathFollowingCore:
         self.controller_heartbeat = bool(ctrl)
         self.path_planning_heartbeat = bool(plan)
         self.collision_avoidance_heartbeat = bool(ca)
+
+    def update_vehicle_status(
+        self,
+        arming_state: int,
+        nav_state: int,
+        is_armed: bool | None = None,
+    ) -> None:
+        self.vehicle_arming_state = int(arming_state)
+        self.vehicle_nav_state = int(nav_state)
+        if is_armed is None:
+            self.vehicle_is_armed = bool(self.vehicle_arming_state == 2)
+        else:
+            self.vehicle_is_armed = bool(is_armed)
+        if self.vehicle_nav_state != PX4_NAVIGATION_STATE_OFFBOARD:
+            self._desired_speed_ramp_started = False
+
+    def has_path(self) -> bool:
+        return bool(self.path.ready and self.path.waypoints_ned is not None)
+
+    def active_guid_type(self) -> int:
+        if int(self.path.interrupt_active) == 1:
+            return 0
+        return int(self.guid_type)
+
+    def uses_mppi_guidance(self) -> bool:
+        return self.active_guid_type() != 0
+
+    def update_desired_speed_target(self, desired_speed_target: float) -> None:
+        desired_speed_target = float(desired_speed_target)
+        if desired_speed_target < 0.0 or not math.isfinite(desired_speed_target):
+            raise ValueError(f"Invalid desired_speed_target: {desired_speed_target}")
+        self.desired_speed_cruise = desired_speed_target
+        self.desired_speed_target = desired_speed_target
 
     def update_timesync_timestamp_us(self, timestamp_us: int) -> None:
         t = float(timestamp_us) * 1.0e-6
@@ -664,13 +753,15 @@ class PathFollowingCore:
     def update_stop_flag(self, flag: bool) -> None:
         self.path.stop_flag = int(bool(flag))
 
+    def apply_degraded_fallback(self) -> None:
+        self.update_interrupt_flag(True)
+        self.update_stop_flag(True)
+        self.mppi.reset_flag = 1
+
     # =====================================================
     # main update
     # =====================================================
     def update(self) -> dict[str, Any] | None:
-        if not (self.controller_heartbeat and self.path_planning_heartbeat and self.collision_avoidance_heartbeat):
-            return None
-
         if not self.path.ready or self.path.waypoints_ned is None:
             return None
 
@@ -720,6 +811,15 @@ class PathFollowingCore:
             np.linalg.norm(waypoints_ned[self.path.heading_index] - position_ned)
         )
         self.path.distance_to_goal = float(np.linalg.norm(waypoints_ned[-1] - position_ned))
+        remaining_distance_to_goal = self._remaining_distance_to_goal_along_path(
+            closest_point_ned=self.path.closest_point_ned,
+            passed_wp_idx=self.path.passed_index,
+            path_waypoints=waypoints_ned,
+        )
+        self.desired_speed_target = self._final_approach_desired_speed_target(
+            remaining_distance_to_goal=remaining_distance_to_goal,
+        )
+        self._update_desired_speed()
 
         acc_cmd_ned, guid_type_used, interrupt_prev, reset_mppi = self._guidance_modules(
             guid_type=self.guid_type,
@@ -798,7 +898,7 @@ class PathFollowingCore:
         data = [
             int(self.path.heading_index),
             int(self.path.passed_index),
-            int(self.guid_type),
+            int(self.active_guid_type()),
             int(self.mppi.reset_flag),
         ]
         self.mppi.reset_flag = 0
@@ -816,6 +916,8 @@ class PathFollowingCore:
             float(self.state.euler_rpy[1]),
             float(self.state.euler_rpy[2]),
             float(self.att_cmd.total_thrust_cmd),
+            float(self.desired_speed),
+            float(self.desired_speed_target),
         ]
 
     def get_mppi_waypoints_ned(self) -> list[float] | None:
@@ -859,6 +961,83 @@ class PathFollowingCore:
         self.mppi.solve_time = 0.0
         self.mppi.reset_flag = 0
 
+    def _update_desired_speed(self) -> None:
+        ramp_cfg = self.cfg.path_following.desired_speed_ramp
+        if not ramp_cfg.enabled:
+            self.desired_speed = float(self.desired_speed_target)
+            return
+
+        initial_speed = min(float(ramp_cfg.min_mps), float(self.desired_speed_target))
+        if int(self.vehicle_nav_state) != PX4_NAVIGATION_STATE_OFFBOARD:
+            self.desired_speed = initial_speed
+            self._desired_speed_ramp_started = False
+            return
+
+        if not self._desired_speed_ramp_started:
+            current_speed = float(np.linalg.norm(self.state.velocity_ned))
+            if not math.isfinite(current_speed):
+                current_speed = initial_speed
+            self.desired_speed = max(0.0, current_speed)
+            self._desired_speed_ramp_started = True
+            return
+
+        delta = float(self.desired_speed_target) - float(self.desired_speed)
+        step = float(ramp_cfg.slope_mps2) * float(self.cfg.path_following.dt_pf)
+        current_speed = float(np.linalg.norm(self.state.velocity_ned))
+        tracking_margin = float(ramp_cfg.tracking_margin_mps)
+        if (
+            tracking_margin > 0.0
+            and math.isfinite(current_speed)
+            and abs(current_speed - float(self.desired_speed)) > tracking_margin
+        ):
+            tracking_error = current_speed - float(self.desired_speed)
+            if (delta > 0.0 and tracking_error < 0.0) or (delta < 0.0 and tracking_error > 0.0):
+                return
+
+        if abs(delta) <= step:
+            self.desired_speed = float(self.desired_speed_target)
+        else:
+            self.desired_speed = float(self.desired_speed + math.copysign(step, delta))
+
+    def _final_approach_desired_speed_target(self, remaining_distance_to_goal: float) -> float:
+        ramp_cfg = self.cfg.path_following.desired_speed_ramp
+        cruise_speed = float(self.desired_speed_cruise)
+        if (
+            not ramp_cfg.enabled
+            or ramp_cfg.slope_mps2 <= 0.0
+            or not math.isfinite(float(remaining_distance_to_goal))
+        ):
+            return cruise_speed
+
+        final_tolerance = float(self.cfg.path_following.guidance_tuning.final_wp_tolerance_m)
+        remaining_distance = max(float(remaining_distance_to_goal) - final_tolerance, 0.0)
+        min_speed = min(float(ramp_cfg.min_mps), cruise_speed)
+        speed_limit = math.sqrt(
+            min_speed * min_speed
+            + 2.0 * float(ramp_cfg.slope_mps2) * remaining_distance
+        )
+        return float(min(cruise_speed, max(min_speed, speed_limit)))
+
+    def _remaining_distance_to_goal_along_path(
+        self,
+        closest_point_ned: np.ndarray,
+        passed_wp_idx: int,
+        path_waypoints: np.ndarray,
+    ) -> float:
+        num_waypoints = int(path_waypoints.shape[0])
+        if num_waypoints < 2:
+            return float("inf")
+
+        segment_idx = int(np.clip(passed_wp_idx, 0, num_waypoints - 2))
+        remaining_distance = float(
+            np.linalg.norm(path_waypoints[segment_idx + 1] - closest_point_ned)
+        )
+        for wp_idx in range(segment_idx + 1, num_waypoints - 1):
+            remaining_distance += float(
+                np.linalg.norm(path_waypoints[wp_idx + 1] - path_waypoints[wp_idx])
+            )
+        return remaining_distance
+
     def _reset_path_tracking_state(self, waypoints_ned: np.ndarray) -> None:
         self.path.initialized = False
         self.path.pf_done = False
@@ -878,6 +1057,7 @@ class PathFollowingCore:
         self.path.interrupt_active = 0
         self.path.interrupt_prev = 0
         self.path.stop_flag = 0
+        self._desired_speed_ramp_started = False
 
     def _relocalize_on_path(self, waypoints_ned: np.ndarray) -> None:
         """Re-localize tracking onto a freshly updated (replanned) path.
@@ -1076,28 +1256,19 @@ class PathFollowingCore:
         gl_vertical_speed_gain: float,
     ) -> tuple[np.ndarray, int, int, int]:
         reset_mppi = 0
-        transition_mode = 0
-
-        if passed_wp_idx < 1:
-            transition_mode = 1
+        del passed_wp_idx
+        del heading_wp_idx
+        del num_waypoints
+        del transition_speed_threshold_mps
 
         if interrupt_active == 1:
             guid_type = 0
             reset_mppi = 1
 
         if (interrupt_active == 0) and (interrupt_prev == 1):
-            transition_mode = 1
+            reset_mppi = 1
 
         interrupt_prev = interrupt_active
-
-        if transition_mode == 1:
-            guid_type = 0
-            reset_mppi = 1
-            if np.linalg.norm(velocity_ned) > transition_speed_threshold_mps:
-                transition_mode = 0
-
-        if heading_wp_idx >= (num_waypoints - 1):
-            guid_type = 0
 
         acc_cmd_ned = np.zeros(3, dtype=float)
 
@@ -1231,7 +1402,7 @@ class PathFollowingCore:
             return
 
         speed_total = float(np.linalg.norm(self.state.velocity_ned))
-        speed_error = abs(self.cfg.path_following.desired_speed - speed_total)
+        speed_error = abs(self.desired_speed - speed_total)
 
         try:
             self.logger.update(
@@ -1243,7 +1414,8 @@ class PathFollowingCore:
                 float(self.mppi.solve_time),
                 float(self.path.cross_track_error),
                 float(speed_error),
-                float(self.cfg.path_following.desired_speed),
+                float(self.desired_speed),
+                float(self.desired_speed_target),
                 self.att_cmd.euler_cmd,
                 float(self.att_cmd.thrust_norm_cmd),
                 thrust_total_cmd=float(self.att_cmd.total_thrust_cmd),
@@ -1253,6 +1425,9 @@ class PathFollowingCore:
                 wp_type_cfg=int(self.wp_type),
                 guid_type_cfg=int(self.guid_type),
                 guid_type_used=int(self._last_guid_type_used),
+                vehicle_arming_state=int(self.vehicle_arming_state),
+                vehicle_nav_state=int(self.vehicle_nav_state),
+                vehicle_is_armed=bool(self.vehicle_is_armed),
                 lookahead_distance_cfg=float(self.cfg.path_following.lookahead_distance),
                 waypoint_switch_distance_cfg=float(self.cfg.path_following.waypoint_switch_distance),
                 wp_idx_heading=int(self.path.heading_index),

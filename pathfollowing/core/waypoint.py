@@ -126,7 +126,7 @@ def _build_external_waypoints(waypoint_x, waypoint_y, waypoint_z) -> np.ndarray:
 
 
 def _build_straight_line() -> np.ndarray:
-    d = 50.0
+    d = 100.0
     h1 = 10.0
     wp0 = 5.0
 
@@ -143,7 +143,7 @@ def _build_straight_line() -> np.ndarray:
 
 def _build_rectangle() -> np.ndarray:
     d = 40.0
-    wp0 = 5.0
+    wp0 = 0.0
     h1 = 10.0
     h2 = 10.0
 

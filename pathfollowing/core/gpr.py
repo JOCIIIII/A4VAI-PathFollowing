@@ -15,6 +15,7 @@ import numpy as np
 
 @dataclass
 class GPRConfig:
+    use_gpr_forecast: bool
     dt_gpr: float
     dt_gpr_opt_mul: int
     forecast_steps: int
@@ -53,6 +54,7 @@ class GPRConfig:
             raise RuntimeError("[FATAL] numerics.eps must be finite and > 0.")
 
         required_keys = (
+            "use_gpr_forecast",
             "dt_gpr",
             "dt_gpr_opt_mul",
             "forecast_steps",
@@ -73,6 +75,10 @@ class GPRConfig:
             missing_list = ", ".join(missing)
             raise RuntimeError(f"[FATAL] missing required gpr keys: {missing_list}")
 
+        use_gpr_forecast = gpr_cfg["use_gpr_forecast"]
+        if not isinstance(use_gpr_forecast, bool):
+            raise RuntimeError("[FATAL] gpr.use_gpr_forecast must be boolean (true/false).")
+
         measurement_matrix = np.asarray(
             gpr_cfg["measurement_matrix"],
             dtype=np.float64,
@@ -92,6 +98,7 @@ class GPRConfig:
             raise RuntimeError("[FATAL] gpr.hyp_l_init and gpr.hyp_q_init need at least 2 elements.")
 
         return cls(
+            use_gpr_forecast=use_gpr_forecast,
             dt_gpr=float(gpr_cfg["dt_gpr"]),
             dt_gpr_opt_mul=int(gpr_cfg["dt_gpr_opt_mul"]),
             forecast_steps=int(gpr_cfg["forecast_steps"]),

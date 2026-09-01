@@ -191,7 +191,8 @@ __device__ void distance_to_path_(
 
     float dist = FLT_MAX;
     bool updated = false;
-    int passed_prev = *wp_idx_passed;
+    int passed_prev = i_clamp_(*wp_idx_passed, 0, n_wp - 2);
+    *wp_idx_passed = passed_prev;
     int heading = i_clamp_(wp_idx_heading, 1, n_wp - 1);
 
     for (int i_wp = heading; i_wp > i_max_(passed_prev - 1, 0); --i_wp) {
@@ -265,6 +266,9 @@ __device__ void vtp_decision_(
     float vt[3]
 )
 {
+    wp_idx_passed = i_clamp_(wp_idx_passed, 0, i_max_(n_wp - 2, 0));
+    get_wp_(wps, i_min_(wp_idx_passed + 1, n_wp - 1), vt);
+
     if (dist_to_path >= virtual_target_distance) {
         copy3_(closest_on_path, vt);
         return;
@@ -321,14 +325,10 @@ __device__ void guidance_modules_(
 )
 {
     (void)acc;
-
-    // starting/terminal phase
-    if (wp_idx_passed < 1 && norm3_(vel) <= transition_speed_threshold_mps) {
-        guid_type = 0;
-    }
-    if (wp_idx_heading >= (n_wp - 1)) {
-        guid_type = 0;
-    }
+    (void)wp_idx_passed;
+    (void)wp_idx_heading;
+    (void)n_wp;
+    (void)transition_speed_threshold_mps;
 
     if (guid_type == 0) {
         float pos_error_ned[3] = {vt[0] - pos[0], vt[1] - pos[1], vt[2] - pos[2]};
@@ -376,7 +376,7 @@ __device__ void guidance_modules_(
     float dcm_wind_to_ned[3][3];
     transpose3x3_(dcm_ned_to_wind, dcm_wind_to_ned);
     matvec3_(dcm_wind_to_ned, acc_cmd_wind, acc_cmd);
-    // acc_cmd[2] = -guid_eta * speed_mag * sinf(err_elev);
+    acc_cmd[2] = -guid_eta * speed_mag * sinf(err_elev);
 }
 
 __device__ void convert_acc_cmd_to_thrust_and_att_(
@@ -734,6 +734,43 @@ __device__ float terminal_cost_1_(
     return p1 * total_time / fmaxf(move_range, min_move_range);
 }
 
+__device__ float rollout_desired_speed_(
+    float current_ref_speed,
+    float target_speed,
+    float ramp_enabled,
+    float ramp_slope,
+    float dt,
+    float actual_speed,
+    float tracking_margin
+)
+{
+    float ref_speed = current_ref_speed;
+    if (ref_speed <= 0.0f) {
+        ref_speed = target_speed;
+    }
+
+    if (ramp_enabled > 0.5f && ramp_slope > 0.0f) {
+        float delta = target_speed - ref_speed;
+        if (tracking_margin > 0.0f && fabsf(actual_speed - ref_speed) > tracking_margin) {
+            float tracking_error = actual_speed - ref_speed;
+            if ((delta > 0.0f && tracking_error < 0.0f) || (delta < 0.0f && tracking_error > 0.0f)) {
+                return fmaxf(ref_speed, 0.0f);
+            }
+        }
+
+        float max_step = ramp_slope * fmaxf(dt, 0.0f);
+        if (fabsf(delta) <= max_step) {
+            ref_speed = target_speed;
+        } else if (delta > 0.0f) {
+            ref_speed += max_step;
+        } else {
+            ref_speed -= max_step;
+        }
+    }
+
+    return fmaxf(ref_speed, 0.0f);
+}
+
 extern "C" __global__ void mppi_rollout_kernel(
     float* arr_u0,
     float* arr_u1,
@@ -789,6 +826,9 @@ extern "C" __global__ void mppi_rollout_kernel(
     float disturbance_var_weight_gain = arr_const[42];
     float disturbance_var_clip = arr_const[43];
     float cost_path_error_scale_m = fmaxf(arr_const[44], EPS_DEN);
+    float desired_speed_ramp_enabled = arr_const[47];
+    float desired_speed_ramp_slope = fmaxf(arr_const[48], 0.0f);
+    float desired_speed_tracking_margin = fmaxf(arr_const[49], 0.0f);
 
     int wp_idx_heading = (int)arr_update[0];
     int wp_idx_passed = (int)arr_update[1];
@@ -799,14 +839,16 @@ extern "C" __global__ void mppi_rollout_kernel(
     float att[3] = {arr_update[9], arr_update[10], arr_update[11]};
     float t_cmd = arr_update[12];
 
-    float desired_speed = arr_update[13];
-    if (desired_speed <= 0.0) desired_speed = desired_speed_const;
+    float desired_speed_start = arr_update[13];
+    if (desired_speed_start <= 0.0f) desired_speed_start = desired_speed_const;
     float virtual_target_distance = arr_update[14];
     if (virtual_target_distance <= 0.0) virtual_target_distance = lookahead_distance_const;
+    float desired_speed_target = arr_update[15];
+    if (desired_speed_target <= 0.0f) desired_speed_target = desired_speed_const;
 
     int n_wp = N_WP;
     wp_idx_heading = i_clamp_(wp_idx_heading, 0, n_wp - 1);
-    wp_idx_passed = i_clamp_(wp_idx_passed, 0, n_wp - 1);
+    wp_idx_passed = i_clamp_(wp_idx_passed, 0, i_max_(n_wp - 2, 0));
 
     float total_cost = 0.0;
 
@@ -840,6 +882,7 @@ extern "C" __global__ void mppi_rollout_kernel(
 
     int final_wp_idx_passed = wp_idx_passed;
     float final_closest[3] = {0.0, 0.0, 0.0};
+    float desired_speed_rollout = desired_speed_start;
 
     for (int i_n = 0; i_n < N; ++i_n) {
         float disturbance_acc_est[3] = {
@@ -919,6 +962,7 @@ extern "C" __global__ void mppi_rollout_kernel(
         );
 
         float mag_v = norm_xy_(vel);
+        float desired_speed = desired_speed_rollout;
         float weight_by_var = disturbance_var_weight_gain * fminf(disturbance_acc_var, disturbance_var_clip);
         float cost_arr[3] = {0.0, 0.0, 0.0};
 
@@ -1020,6 +1064,15 @@ extern "C" __global__ void mppi_rollout_kernel(
         acc[0] = (vel[0] - vel_prev[0]) / fmaxf(dt, EPS_DIV);
         acc[1] = (vel[1] - vel_prev[1]) / fmaxf(dt, EPS_DIV);
         acc[2] = (vel[2] - vel_prev[2]) / fmaxf(dt, EPS_DIV);
+        desired_speed_rollout = rollout_desired_speed_(
+            desired_speed_rollout,
+            desired_speed_target,
+            desired_speed_ramp_enabled,
+            desired_speed_ramp_slope,
+            dt,
+            norm_xy_(vel),
+            desired_speed_tracking_margin
+        );
 
         final_wp_idx_passed = wp_idx_passed;
         copy3_(closest_on_path, final_closest);
@@ -1031,7 +1084,7 @@ extern "C" __global__ void mppi_rollout_kernel(
             P,
             vel,
             dist_to_path,
-            desired_speed,
+            desired_speed_rollout,
             cost_path_error_scale_m
         );
     } else {

@@ -223,8 +223,50 @@ class GuidanceTuningConfig:
 
 
 @dataclass
+class DesiredSpeedRampConfig:
+    enabled: bool
+    min_mps: float
+    slope_mps2: float
+    tracking_margin_mps: float
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any], target_speed: float) -> "DesiredSpeedRampConfig":
+        ramp_cfg = cfg.get("desired_speed_ramp")
+        if ramp_cfg is None:
+            return cls(
+                enabled=False,
+                min_mps=float(target_speed),
+                slope_mps2=0.0,
+                tracking_margin_mps=0.0,
+            )
+        if not isinstance(ramp_cfg, dict):
+            raise RuntimeError("[FATAL] path_following.desired_speed_ramp must be a mapping.")
+
+        enabled = bool(ramp_cfg.get("enabled", False))
+        min_mps = float(ramp_cfg.get("min_mps", target_speed))
+        slope_mps2 = float(ramp_cfg.get("slope_mps2", 0.0))
+        tracking_margin_mps = float(ramp_cfg.get("tracking_margin_mps", 0.0))
+        if min_mps < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.min_mps must be >= 0.")
+        if enabled and slope_mps2 <= 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.slope_mps2 must be > 0.")
+        if not enabled and slope_mps2 < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.slope_mps2 must be >= 0.")
+        if tracking_margin_mps < 0.0:
+            raise RuntimeError("[FATAL] desired_speed_ramp.tracking_margin_mps must be >= 0.")
+
+        return cls(
+            enabled=enabled,
+            min_mps=min_mps,
+            slope_mps2=slope_mps2,
+            tracking_margin_mps=tracking_margin_mps,
+        )
+
+
+@dataclass
 class PathFollowingConfig:
     desired_speed: float
+    desired_speed_ramp: DesiredSpeedRampConfig
     lookahead_distance: float
     waypoint_switch_distance: float
     guid_eta: float
@@ -245,6 +287,7 @@ class PathFollowingConfig:
             "path_following",
         )
         desired_speed = float(pf_cfg["desired_speed"])
+        desired_speed_ramp = DesiredSpeedRampConfig.from_dict(pf_cfg, desired_speed)
         lookahead_distance = float(pf_cfg["lookahead_distance"])
         waypoint_switch_distance = float(pf_cfg["waypoint_switch_distance"])
         if desired_speed < 0.0 or lookahead_distance <= 0.0 or waypoint_switch_distance <= 0.0:
@@ -260,6 +303,7 @@ class PathFollowingConfig:
 
         return cls(
             desired_speed=desired_speed,
+            desired_speed_ramp=desired_speed_ramp,
             lookahead_distance=lookahead_distance,
             waypoint_switch_distance=waypoint_switch_distance,
             guid_eta=float(pf_cfg["guid_eta"]),
@@ -375,7 +419,6 @@ class MPPIConfig:
     num_samples: int
     horizon_steps: int
     cost_min_v_aligned: float
-    use_gpr_forecast: bool
     rollout_tuning: MPPIRolloutTuningConfig
     type_1: MPPITypeConfig
     type_2: MPPITypeConfig
@@ -391,16 +434,12 @@ class MPPIConfig:
                 "num_samples",
                 "horizon_steps",
                 "cost_min_v_aligned",
-                "use_gpr_forecast",
             ),
             "mppi",
         )
         dt_mppi = float(mppi_cfg["dt_mppi"])
         num_samples = int(mppi_cfg["num_samples"])
         horizon_steps = int(mppi_cfg["horizon_steps"])
-        use_gpr_forecast = mppi_cfg["use_gpr_forecast"]
-        if not isinstance(use_gpr_forecast, bool):
-            raise RuntimeError("[FATAL] mppi.use_gpr_forecast must be boolean (true/false).")
         if dt_mppi <= 0.0 or num_samples <= 0 or horizon_steps <= 0:
             raise RuntimeError("[FATAL] mppi dt_mppi/num_samples/horizon_steps must be > 0.")
 
@@ -429,7 +468,6 @@ class MPPIConfig:
             num_samples=num_samples,
             horizon_steps=horizon_steps,
             cost_min_v_aligned=float(mppi_cfg["cost_min_v_aligned"]),
-            use_gpr_forecast=use_gpr_forecast,
             rollout_tuning=rollout,
             type_1=MPPITypeConfig.from_dict(mppi_cfg[type_1_key]),
             type_2=MPPITypeConfig.from_dict(mppi_cfg[type_2_key]),
@@ -497,6 +535,8 @@ class VehicleState:
     velocity_ned: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     euler_rpy: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     thrust_cmd: float = 0.0
+    desired_speed: float = 0.0
+    desired_speed_target: float = 0.0
 
 
 @dataclass
@@ -555,7 +595,7 @@ class MPPICore:
         self.last_solve_time = 0.0
 
         self.gpr = GPRCore(self.cfg.gpr)
-        self.use_gpr_forecast = self.cfg.mppi.use_gpr_forecast
+        self.use_gpr_forecast = self.cfg.gpr.use_gpr_forecast
 
         self.module = None
         self.func_mc = None
@@ -572,7 +612,7 @@ class MPPICore:
         self.gpu_stk = None
 
         # ★ desired_speed 런타임 override (외부 /desired_speed 토픽 or 학습 신경망).
-        #   None 이면 config 값(self.cfg.path_following.desired_speed) 사용 = 기존 동작.
+        #   None 이면 PF core 가 램프 계산한 vehicle_state.desired_speed 사용 = upstream 동작.
         #   값이 있으면 host_update[13] 에 그 값을 넣어 MPPI cruise 목표속도를 동적 갱신.
         self.desired_speed_override = None
 
@@ -629,6 +669,14 @@ class MPPICore:
         self.vehicle_state.velocity_ned[:] = [float(data[3]), float(data[4]), float(data[5])]
         self.vehicle_state.euler_rpy[:] = [float(data[6]), float(data[7]), float(data[8])]
         self.vehicle_state.thrust_cmd = float(data[9])
+        if len(data) >= 11:
+            self.vehicle_state.desired_speed = float(data[10])
+        else:
+            self.vehicle_state.desired_speed = float(self.cfg.path_following.desired_speed)
+        if len(data) >= 12:
+            self.vehicle_state.desired_speed_target = float(data[11])
+        else:
+            self.vehicle_state.desired_speed_target = float(self.cfg.path_following.desired_speed)
         check = np.array(
             [
                 self.vehicle_state.position_ned[0],
@@ -641,11 +689,17 @@ class MPPICore:
                 self.vehicle_state.euler_rpy[1],
                 self.vehicle_state.euler_rpy[2],
                 self.vehicle_state.thrust_cmd,
+                self.vehicle_state.desired_speed,
+                self.vehicle_state.desired_speed_target,
             ],
             dtype=np.float32,
         )
         if not np.isfinite(check).all():
             raise RuntimeError("[FATAL] MPPI/in/vehicle_state contains non-finite value.")
+        if self.vehicle_state.desired_speed < 0.0:
+            raise RuntimeError("[FATAL] MPPI/in/vehicle_state desired_speed must be >= 0.")
+        if self.vehicle_state.desired_speed_target < 0.0:
+            raise RuntimeError("[FATAL] MPPI/in/vehicle_state desired_speed_target must be >= 0.")
         self.has_vehicle_state = True
 
     def update_waypoints(self, data) -> None:
@@ -704,8 +758,6 @@ class MPPICore:
     # public api
     # =====================================================
     def optimize_gpr_if_needed(self) -> None:
-        if not self.use_gpr_forecast:
-            return
         if self.runtime_flags.wp_idx_passed >= 1:
             self.gpr.optimize_hyperparams()
 
@@ -846,6 +898,9 @@ class MPPICore:
                 float(rt.cost_path_error_scale_m),
                 float(rt.gpr_var_bias),
                 float(rt.gpr_var_clip),
+                float(1.0 if self.cfg.path_following.desired_speed_ramp.enabled else 0.0),
+                float(self.cfg.path_following.desired_speed_ramp.slope_mps2),
+                float(self.cfg.path_following.desired_speed_ramp.tracking_margin_mps),
             ],
             dtype=np.float32,
         )
@@ -873,7 +928,7 @@ class MPPICore:
 
         # Host buffers are preallocated and reused every solve() step.
         self.host_const = self._make_const_vector(self.guid_type)
-        self.host_update = np.zeros(15, dtype=np.float32)
+        self.host_update = np.zeros(16, dtype=np.float32)
         self.host_delta_u0 = np.zeros((n, k), dtype=np.float32)
         self.host_delta_u1 = np.zeros((n, k), dtype=np.float32)
         self.host_res_stk = np.empty(k, dtype=np.float32)
@@ -986,12 +1041,19 @@ class MPPICore:
         self.host_update[10] = float(self.vehicle_state.euler_rpy[1])
         self.host_update[11] = float(self.vehicle_state.euler_rpy[2])
         self.host_update[12] = float(self.vehicle_state.thrust_cmd)
-        # ★ override 있으면 그 값(동적 desired_speed), 없으면 config 기본값.
-        _des_spd = (self.desired_speed_override
-                    if self.desired_speed_override is not None
-                    else self.cfg.path_following.desired_speed)
-        self.host_update[13] = float(_des_spd)
+        # ★ desired_speed 런타임 override (/desired_speed 토픽). override 가 있으면
+        #   시작속도([13])와 목표속도([15]) 모두 override 값으로 넣어 커널 램프를 무력화하고
+        #   일정 순항속도로 동작(기존 포크 동작). 없으면 PF core 가 램프 계산한
+        #   vehicle_state.desired_speed / desired_speed_target 사용(upstream 동작).
+        if self.desired_speed_override is not None:
+            _des_spd = float(self.desired_speed_override)
+            _des_spd_target = _des_spd
+        else:
+            _des_spd = float(self.vehicle_state.desired_speed)
+            _des_spd_target = float(self.vehicle_state.desired_speed_target)
+        self.host_update[13] = _des_spd
         self.host_update[14] = float(self.cfg.path_following.lookahead_distance)
+        self.host_update[15] = _des_spd_target
 
         cuda.memcpy_htod(self.gpu_u0, self.u0)
         cuda.memcpy_htod(self.gpu_u1, self.u1)

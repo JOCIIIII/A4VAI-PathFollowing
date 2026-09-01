@@ -9,7 +9,8 @@
 node_pathfollowing:
   ros__parameters:
     model:
-      mass: 2.0262
+      # mass: 2.0262
+      mass: 2
       Ixx: 0.029125
       Iyy: 0.029125
       Izz: 0.055225

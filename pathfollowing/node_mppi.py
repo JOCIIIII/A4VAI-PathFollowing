@@ -47,6 +47,7 @@ class NodeMPPI(Node):
             vehicle_cfg=vehicle_cfg,
             sim_cfg=sim_cfg,
         )
+        self.solve_loop_id = 0
 
         # =====================================================
         # subscribers
@@ -204,8 +205,9 @@ class NodeMPPI(Node):
         if output is None:
             return
 
+        self.solve_loop_id += 1
         msg = Float32MultiArray()
-        msg.data = output
+        msg.data = list(output) + [float(self.solve_loop_id)]
         self.mppi_output_publisher.publish(msg)
 
     def _gpr_opt_timer_callback(self) -> None:

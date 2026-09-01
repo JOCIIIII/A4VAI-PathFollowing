@@ -13,8 +13,8 @@ node_pathfollowing:
 
     guid_type: 2
     # 0: Pos. Ctrl, 1: MPPI-GL (original cost), 2: MPPI-GL (cruise speed control)
-    
-    wp_type: 7
+
+    wp_type: 1
     # 0: path planning solution, 1: straight line, 2: rectangle
     # 3: zigzag, 4: circle, 5: figure-8
     # 6: Alt change, 7: Spiral, 8: Lissajous curve (figure 8)
@@ -22,6 +22,12 @@ node_pathfollowing:
     path_following:
       dt_pf: 0.004
       desired_speed: 1.5
+      desired_speed_ramp:
+        enabled: true
+        # enabled: false
+        min_mps: 0.5        
+        slope_mps2: 0.3
+        tracking_margin_mps: 0.1
       lookahead_distance: 4.5
       waypoint_switch_distance: 4.5
 
@@ -48,7 +54,6 @@ node_pathfollowing:
       num_samples: 512
       horizon_steps: 100
       cost_min_v_aligned: 0.3
-      use_gpr_forecast: true
 
       # rollout tuning
       type2_gamma_scale: 0.05
@@ -72,20 +77,21 @@ node_pathfollowing:
       type_2:
         state_cost: [75.0, 50.0, 5.0]       # Q
         terminal_cost: [0.0, 50.0, 5.0]     # P
-        noise_std_u0_scale: 0.04472135955
-        noise_std_u1_scale: 0.08944271910
+        noise_std_u0_scale: 0.045
+        noise_std_u1_scale: 0.089
         lambda_weight: 0.1
         u0_init: 0.0
         u1_init: 2.0
 
 
     ndo:
-      gain: [5.0, 5.0, 5.0]
+      gain: [2.0, 2.0, 2.0]
 
     numerics:
       eps: 1.0e-9
 
     gpr:
+      use_gpr_forecast: true
       dt_gpr: 0.01
       dt_gpr_opt_mul: 20
       forecast_steps: 2000
@@ -105,3 +111,40 @@ node_pathfollowing:
       hyp_q_max: 0.5
 
       lpf_cutoff_hz: 5
+
+    safety:
+      enabled: true
+      strict_startup_check: false
+
+      startup_monitor_period_s: 1.0
+      mppi_input_period_ratio: 0.5
+      path_following_heartbeat_period_s: 1.0
+      path_following_waypoint_plot_period_s: 5.0
+      runtime_flags_period_s: 1.0
+      mppi_waypoint_period_multiplier: 10.0
+
+      controller_hb_warn_timeout_s: 0.2
+      controller_hb_hold_timeout_s: 1.0
+      path_hb_warn_timeout_s: 0.5
+      path_hb_hold_timeout_s: 2.0
+      collision_hb_warn_timeout_s: 0.5
+      collision_hb_hold_timeout_s: 2.0
+
+      path_warn_timeout_s: 0.5
+      path_degraded_timeout_s: 1.0
+      path_hold_timeout_s: 2.0
+      no_valid_path_hold_timeout_s: 0.5
+
+      vehicle_state_warn_timeout_s: 2.0
+      vehicle_state_degraded_timeout_s: 5.0
+      vehicle_state_hold_timeout_s: 10.0
+
+      mppi_nonfinite_degraded_count: 3
+      mppi_nonfinite_hold_count: 5
+      mppi_deadline_degraded_count: 5
+      mppi_deadline_warn_ratio: 1.0
+      mppi_deadline_reject_ratio: 2.0
+      mppi_output_stale_ratio: 40.0
+      mppi_output_stale_hold_ratio: 5.0
+
+      safety_log_throttle_s: 1.0

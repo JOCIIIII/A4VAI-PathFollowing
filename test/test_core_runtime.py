@@ -110,6 +110,7 @@ def _sim_cfg() -> dict:
         "ndo": {"gain": [5.0, 5.0, 5.0]},
         "numerics": {"eps": 1.0e-9},
         "gpr": {
+            "use_gpr_forecast": True,
             "dt_gpr": 0.01,
             "dt_gpr_opt_mul": 20,
             "forecast_steps": 200,

@@ -181,6 +181,90 @@ class GuidanceTuningConfig:
     position_kv_multiplier: float
     min_guid_eta: float
     gl_vertical_speed_gain: float
+    # Optional speed-regulated pursuit for guid 0. With the defaults the legacy
+    # law (|v_cmd| = position_kp * distance to the virtual target) is unchanged.
+    pos_speed_mode: bool = False
+    lookahead_time_s: float = 0.0
+    lookahead_max_m: float = 0.0
+    brake_accel_mps2: float = 0.0
+    # Speed mode extras: centripetal feed-forward from the path curvature
+    # (|a| = gain * v^2 * kappa, taken lead_s ahead to cover the velocity-loop lag,
+    # capped at max_accel) and a cross-track velocity term that pulls the vehicle
+    # back onto the path even when the speed reference is ~0.
+    curvature_ff_gain: float = 0.0
+    curvature_ff_lead_s: float = 0.0
+    curvature_ff_max_accel: float = 0.0
+    xt_gain: float = 0.0
+    ndo_max_accel: float = 0.0
+    # declare done only below this speed [m/s] (0 = legacy): done hands over to the
+    # flight manager's landing, which drifted 0.8-1.8 m when entered at 1-2 m/s
+    done_speed_max: float = 0.0
+    # terminal convergence [m/s] (0 = off): once the vehicle is at/past the end of the path
+    # (no path length left) it is pulled back to the last waypoint at
+    # min(terminal_speed_max, position_kp * distance). Without it an overshoot of the end
+    # left speed_ref at 0 (no remaining length), so the vehicle hovered just outside the
+    # done radius and SUPER kept replanning around the goal (s7l).
+    terminal_speed_max: float = 0.0
+    # vertical priority (PX4 style, default off): keep the commanded vertical specific force
+    # (>= 0.2 g up), fit the horizontal part into the tilt cone and the thrust limit, and size
+    # the thrust for the PLANNED attitude (vertical / cos(tilt)). The legacy thrust is the
+    # projection of the command onto the CURRENT body axis, which collapses to its 0.2 g floor
+    # when the command swings far from the present attitude: a 5 m/s reversal commanded by the
+    # noclimb CA policy (nc_c) cut thrust to 0.14 and dropped the vehicle 1.2 m at 1.6 m/s.
+    vertical_priority: bool = False
+    # MPPI engages on speed (default off): leave the pursuit start-up law once the vehicle moves
+    # faster than transition_speed_threshold_mps even before the first waypoint is passed - the
+    # rule the MPPI rollout kernel already uses. Off, MPPI waits for passed_wp_idx >= 1, which a
+    # path re-sent from the vehicle position every step (learned CA, 20 Hz) never reaches.
+    mppi_speed_transition: bool = False
+    # yaw command: 'waypoint' (default: toward the heading waypoint), 'velocity' (along the
+    # vehicle's horizontal velocity, i.e. the direction of travel; below yaw_min_speed the last
+    # yaw is kept) or 'hold' (the yaw when following starts). With the learned CA policy's
+    # waypoints jumping every 50 ms, 'waypoint' made the yaw setpoint wobble (~80 deg/s rms);
+    # the velocity cannot jump, so 'velocity' points the nose where the vehicle goes, smoothly.
+    yaw_mode: str = "waypoint"
+    yaw_hold: bool = False             # legacy switch for yaw_mode 'hold'
+    yaw_rate_limit_deg: float = 0.0    # max rate of the yaw command [deg/s], 0 = none
+    yaw_min_speed: float = 1.0         # 'velocity' mode: below this horizontal speed keep the yaw
+    # first-order smoothing of the MPPI output (updated at 20 Hz, applied at 250 Hz) [s], 0 = off
+    mppi_output_tau_s: float = 0.0
+    # MPPI's lateral law is gain * speed * sin(heading error): with the target behind (a reversal
+    # commanded by the learned CA) it vanishes and the vehicle kept flying away, climbing and
+    # tilting to 50 deg. Beyond this heading error [deg] the pursuit law takes the step
+    # (decelerate and turn); the rollout model applies the same rule. 0 = off.
+    mppi_max_heading_error_deg: float = 0.0
+    # speed feedback added to MPPI's forward acceleration: u0 + kp * (speed_ref - speed) [1/s].
+    # MPPI alone regulated the speed slowly (5 m/s reference, the vehicle drifted to 6.6 m/s with
+    # u0 near 0); the rollout model applies the same term. 0 = off.
+    mppi_speed_kp: float = 0.0
+    # speed cap on the forward acceleration: min(acc, kp * (speed_ref + margin - speed)).
+    # With mppi_speed_kp alone the vehicle still settled at 6.6 m/s for a 5 m/s reference: MPPI's
+    # u0 random-walked around +1.2 (white per-step exploration barely moves the speed inside the
+    # horizon) and cancelled the feedback. Continuous, so no switching; the rollout model applies
+    # the same cap. kp 0 = off.
+    mppi_speed_guard_kp: float = 0.0
+    mppi_speed_guard_margin: float = 0.3
+    # corner speed (default off): at a path vertex turning by dpsi the vehicle is meant to fly the
+    # arc of radius R = corner_max_error_m / (1 - cos(dpsi/2)) - the arc's mid-point is then
+    # corner_max_error_m inside the polyline - at v_c = sqrt(corner_lat_accel_mps2 * R) (floor
+    # corner_min_speed_mps). The arc starts d = R tan(dpsi/2) before the vertex (at most half of
+    # either segment, R shrinks to fit); before it speed_ref <= sqrt(v_c^2 + 2 a (s - d)) with
+    # a = corner_brake_accel_mps2 and s the distance to the vertex, after the vertex the same law
+    # on the distance from it (the turn's second half, then speeding up). Kinks below
+    # corner_min_angle_deg are ignored. Without it MPPI flew 90 deg corners of a 50 m square at
+    # 10 m/s and overshot 8-10 m (35 deg tilt limit: turn radius ~14.5 m). The rollout model
+    # applies the same limit (see mppi_rollout_sync).
+    corner_speed_enable: bool = False
+    corner_lat_accel_mps2: float = 4.0
+    corner_max_error_m: float = 1.5
+    corner_brake_accel_mps2: float = 3.0
+    corner_min_speed_mps: float = 1.0
+    corner_min_angle_deg: float = 10.0
+    # MPPI rollout = PF guidance (default off): the rollout also uses the PF's speed-dependent
+    # lookahead (lookahead_time_s / lookahead_max_m; the rollout otherwise keeps the fixed
+    # lookahead_distance - 2 m against the PF's 6 m at 10 m/s) and the end-of-path braking cap
+    # (brake_accel_mps2). Read by node_mppi (core_mppi.GuidanceTuningConfig).
+    mppi_rollout_sync: bool = False
 
     @classmethod
     def from_dict(
@@ -219,6 +303,21 @@ class GuidanceTuningConfig:
         if gl_vertical_speed_gain <= 0.0:
             raise RuntimeError(f"[FATAL] {scope}.gl_vertical_speed_gain must be > 0.")
 
+        lookahead_time_s = float(cfg.get("lookahead_time_s", 0.0))
+        lookahead_max_m = float(cfg.get("lookahead_max_m", 0.0))
+        brake_accel_mps2 = float(cfg.get("brake_accel_mps2", 0.0))
+        curvature_ff_gain = float(cfg.get("curvature_ff_gain", 0.0))
+        curvature_ff_lead_s = float(cfg.get("curvature_ff_lead_s", 0.0))
+        curvature_ff_max_accel = float(cfg.get("curvature_ff_max_accel", 0.0))
+        xt_gain = float(cfg.get("xt_gain", 0.0))
+        ndo_max_accel = float(cfg.get("ndo_max_accel", 0.0))
+        done_speed_max = float(cfg.get("done_speed_max", 0.0))
+        terminal_speed_max = float(cfg.get("terminal_speed_max", 0.0))
+        if min(lookahead_time_s, lookahead_max_m, brake_accel_mps2, curvature_ff_gain,
+               curvature_ff_lead_s, curvature_ff_max_accel, xt_gain, ndo_max_accel,
+               done_speed_max, terminal_speed_max) < 0.0:
+            raise RuntimeError(f"[FATAL] {scope} speed-mode parameters must be >= 0.")
+
         return cls(
             final_wp_tolerance_m=final_wp_tolerance_m,
             transition_speed_threshold_mps=transition_speed_threshold_mps,
@@ -226,6 +325,35 @@ class GuidanceTuningConfig:
             position_kv_multiplier=position_kv_multiplier,
             min_guid_eta=min_guid_eta,
             gl_vertical_speed_gain=gl_vertical_speed_gain,
+            pos_speed_mode=bool(cfg.get("pos_speed_mode", False)),
+            lookahead_time_s=lookahead_time_s,
+            lookahead_max_m=lookahead_max_m,
+            brake_accel_mps2=brake_accel_mps2,
+            curvature_ff_gain=curvature_ff_gain,
+            curvature_ff_lead_s=curvature_ff_lead_s,
+            curvature_ff_max_accel=curvature_ff_max_accel,
+            xt_gain=xt_gain,
+            ndo_max_accel=ndo_max_accel,
+            done_speed_max=done_speed_max,
+            terminal_speed_max=terminal_speed_max,
+            vertical_priority=bool(cfg.get("vertical_priority", False)),
+            mppi_speed_transition=bool(cfg.get("mppi_speed_transition", False)),
+            yaw_mode=str(cfg.get("yaw_mode", "hold" if bool(cfg.get("yaw_hold", False)) else "waypoint")),
+            yaw_hold=bool(cfg.get("yaw_hold", False)),
+            yaw_rate_limit_deg=max(float(cfg.get("yaw_rate_limit_deg", 0.0)), 0.0),
+            yaw_min_speed=max(float(cfg.get("yaw_min_speed", 1.0)), 0.0),
+            mppi_output_tau_s=max(float(cfg.get("mppi_output_tau_s", 0.0)), 0.0),
+            mppi_max_heading_error_deg=max(float(cfg.get("mppi_max_heading_error_deg", 0.0)), 0.0),
+            mppi_speed_kp=max(float(cfg.get("mppi_speed_kp", 0.0)), 0.0),
+            mppi_speed_guard_kp=max(float(cfg.get("mppi_speed_guard_kp", 0.0)), 0.0),
+            mppi_speed_guard_margin=max(float(cfg.get("mppi_speed_guard_margin", 0.3)), 0.0),
+            corner_speed_enable=bool(cfg.get("corner_speed_enable", False)),
+            corner_lat_accel_mps2=max(float(cfg.get("corner_lat_accel_mps2", 4.0)), 0.1),
+            corner_max_error_m=max(float(cfg.get("corner_max_error_m", 1.5)), 0.05),
+            corner_brake_accel_mps2=max(float(cfg.get("corner_brake_accel_mps2", 3.0)), 0.1),
+            corner_min_speed_mps=max(float(cfg.get("corner_min_speed_mps", 1.0)), 0.0),
+            corner_min_angle_deg=max(float(cfg.get("corner_min_angle_deg", 10.0)), 0.1),
+            mppi_rollout_sync=bool(cfg.get("mppi_rollout_sync", False)),
         )
 
 
@@ -454,6 +582,11 @@ class PathState:
     interrupt_prev: int = 0
     stop_flag: int = 0
 
+    # what the guidance used this step (logged): speed reference after the end-of-path and
+    # corner limits (-1 = none) and the virtual-target lookahead [m]
+    speed_ref: float = -1.0
+    lookahead: float = 0.0
+
 
 @dataclass
 class MPPIState:
@@ -532,6 +665,9 @@ class PathFollowingCore:
         self._time0 = 0.0
         self._waypoint_ack_pending = False
         self._last_guid_type_used = int(self.guid_type)
+        self._yaw_hold_rad = None
+        self._yaw_cmd_prev = None
+        self._mppi_u_filtered = None
 
         self._initialize_mppi_state()
 
@@ -633,6 +769,17 @@ class PathFollowingCore:
         if bool(path_planning_complete):
             self._waypoint_ack_pending = True
 
+    def _mppi_input(self) -> np.ndarray:
+        raw = np.array([self.mppi.u0, self.mppi.u1], dtype=float)
+        tau = self.cfg.path_following.guidance_tuning.mppi_output_tau_s
+        if tau <= 0.0:
+            return raw
+        if self._mppi_u_filtered is None:
+            self._mppi_u_filtered = raw.copy()
+        dt = self.cfg.path_following.dt_pf
+        self._mppi_u_filtered += dt / (tau + dt) * (raw - self._mppi_u_filtered)
+        return self._mppi_u_filtered.copy()
+
     def update_mppi_output(self, u0: float, u1: float, solve_time: float) -> None:
         values = np.asarray([u0, u1, solve_time], dtype=float)
         if not np.isfinite(values).all():
@@ -650,6 +797,10 @@ class PathFollowingCore:
 
     def update_interrupt_flag(self, flag: bool) -> None:
         self.path.interrupt_active = int(bool(flag))
+
+    def update_desired_speed(self, speed: float) -> None:
+        if math.isfinite(speed) and speed >= 0.0:
+            self.cfg.path_following.desired_speed = float(speed)
 
     def update_guid_type(self, guid_type: int) -> None:
         new_guid_type = int(guid_type)
@@ -702,12 +853,49 @@ class PathFollowingCore:
             final_wp_tolerance=self.cfg.path_following.guidance_tuning.final_wp_tolerance_m,
         )
         self.path.heading_index = int(heading_index)
+        done_speed_max = self.cfg.path_following.guidance_tuning.done_speed_max
+        if pf_done and done_speed_max > 0.0 and float(np.linalg.norm(velocity_ned)) > done_speed_max:
+            pf_done = False
         self.path.pf_done = bool(pf_done)
+
+        tuning = self.cfg.path_following.guidance_tuning
+        lookahead = self.cfg.path_following.lookahead_distance
+        if tuning.lookahead_time_s > 0.0:
+            lookahead = max(lookahead, float(np.linalg.norm(velocity_ned)) * tuning.lookahead_time_s)
+            if tuning.lookahead_max_m > 0.0:
+                lookahead = min(lookahead, tuning.lookahead_max_m)
+
+        speed_ref = -1.0
+        if tuning.pos_speed_mode:
+            speed_ref = float(self.cfg.path_following.desired_speed)
+            if tuning.brake_accel_mps2 > 0.0:
+                remaining = self._remaining_path_length(
+                    waypoints_ned, self.path.passed_index, self.path.closest_point_ned
+                )
+                speed_ref = min(speed_ref, math.sqrt(2.0 * tuning.brake_accel_mps2 * remaining))
+                if tuning.terminal_speed_max > 0.0 and remaining < 0.05:
+                    d_end = float(np.linalg.norm(waypoints_ned[-1] - position_ned))
+                    speed_ref = max(speed_ref, min(tuning.terminal_speed_max,
+                                                   tuning.position_kp * d_end))
+        if tuning.corner_speed_enable:
+            if speed_ref < 0.0:
+                speed_ref = float(self.cfg.path_following.desired_speed)
+            speed_ref = min(speed_ref, self._corner_speed_limit(
+                waypoints_ned, self.path.passed_index, self.path.closest_point_ned, speed_ref, tuning))
+        self.path.speed_ref = float(speed_ref)
+        self.path.lookahead = float(lookahead)
+
+        acc_ff_ned = np.zeros(3, dtype=float)
+        if tuning.pos_speed_mode and tuning.curvature_ff_gain > 0.0:
+            acc_ff_ned = self._curvature_feedforward(
+                waypoints_ned, self.path.passed_index, self.path.closest_point_ned,
+                float(np.linalg.norm(velocity_ned)), tuning,
+            )
 
         prev_virtual_target = self.path.virtual_target_ned.copy()
         virtual_target = self._vtp_decision(
             dist_to_path=dist_to_path,
-            lookahead_distance=self.cfg.path_following.lookahead_distance,
+            lookahead_distance=lookahead,
             closest_point_ned=self.path.closest_point_ned,
             passed_wp_idx=self.path.passed_index,
             path_waypoints=waypoints_ned,
@@ -730,7 +918,7 @@ class PathFollowingCore:
             position_ned=position_ned,
             velocity_ned=velocity_ned,
             guid_eta=self.cfg.path_following.guid_eta,
-            mppi_ctrl_input=np.array([self.mppi.u0, self.mppi.u1], dtype=float),
+            mppi_ctrl_input=self._mppi_input(),
             interrupt_active=self.path.interrupt_active,
             interrupt_prev=self.path.interrupt_prev,
             transition_speed_threshold_mps=self.cfg.path_following.guidance_tuning.transition_speed_threshold_mps,
@@ -738,6 +926,11 @@ class PathFollowingCore:
             position_kv_multiplier=self.cfg.path_following.guidance_tuning.position_kv_multiplier,
             min_guid_eta=self.cfg.path_following.guidance_tuning.min_guid_eta,
             gl_vertical_speed_gain=self.cfg.path_following.guidance_tuning.gl_vertical_speed_gain,
+            speed_ref=speed_ref,
+            off_path=bool(dist_to_path >= lookahead),
+            closest_point_ned=self.path.closest_point_ned,
+            xt_gain=tuning.xt_gain,
+            acc_ff_ned=acc_ff_ned,
         )
         self.path.interrupt_prev = int(interrupt_prev)
         self._last_guid_type_used = int(guid_type_used)
@@ -1074,11 +1267,17 @@ class PathFollowingCore:
         position_kv_multiplier: float,
         min_guid_eta: float,
         gl_vertical_speed_gain: float,
+        speed_ref: float = -1.0,
+        off_path: bool = False,
+        closest_point_ned: np.ndarray | None = None,
+        xt_gain: float = 0.0,
+        acc_ff_ned: np.ndarray | None = None,
     ) -> tuple[np.ndarray, int, int, int]:
         reset_mppi = 0
         transition_mode = 0
 
-        if passed_wp_idx < 1:
+        if passed_wp_idx < 1 and not (self.cfg.path_following.guidance_tuning.mppi_speed_transition
+                                      and np.linalg.norm(velocity_ned) > transition_speed_threshold_mps):
             transition_mode = 1
 
         if interrupt_active == 1:
@@ -1099,6 +1298,13 @@ class PathFollowingCore:
         if heading_wp_idx >= (num_waypoints - 1):
             guid_type = 0
 
+        max_err = self.cfg.path_following.guidance_tuning.mppi_max_heading_error_deg
+        if guid_type in (1, 2) and max_err > 0.0 and math.hypot(velocity_ned[0], velocity_ned[1]) > 1e-3:
+            az_v = math.atan2(velocity_ned[1], velocity_ned[0])
+            az_t = math.atan2(virtual_target_ned[1] - position_ned[1], virtual_target_ned[0] - position_ned[0])
+            if abs((az_t - az_v + math.pi) % (2.0 * math.pi) - math.pi) > math.radians(max_err):
+                guid_type = 0
+
         acc_cmd_ned = np.zeros(3, dtype=float)
 
         if guid_type == 0:
@@ -1106,9 +1312,26 @@ class PathFollowingCore:
             kp_pos = position_kp
             vel_cmd_ned = kp_pos * pos_error_ned
 
+            # Speed-regulated pursuit: keep the direction to the virtual target but
+            # fly it at speed_ref (already limited by the braking distance left on
+            # the path). Off the path the legacy proportional speed is the cap, so a
+            # large cross-track error is closed gently instead of at cruise speed.
+            if speed_ref >= 0.0:
+                dist = float(np.linalg.norm(pos_error_ned))
+                if dist > self.cfg.numerics.eps:
+                    v_mag = min(speed_ref, kp_pos * dist) if off_path else speed_ref
+                    vel_cmd_ned = pos_error_ned * (v_mag / dist)
+                    if xt_gain > 0.0 and closest_point_ned is not None:
+                        # cross-track pull toward the path, normal to the pursuit direction
+                        t_hat = pos_error_ned / dist
+                        e = closest_point_ned - position_ned
+                        vel_cmd_ned = vel_cmd_ned + xt_gain * (e - float(np.dot(e, t_hat)) * t_hat)
+
             vel_error_ned = vel_cmd_ned - velocity_ned
             kp_vel = kp_pos * position_kv_multiplier
             acc_cmd_ned = kp_vel * vel_error_ned
+            if speed_ref >= 0.0 and acc_ff_ned is not None:
+                acc_cmd_ned = acc_cmd_ned + acc_ff_ned
 
         elif guid_type in (1, 2):
             guid_eta = max(mppi_ctrl_input[1], min_guid_eta)
@@ -1119,6 +1342,13 @@ class PathFollowingCore:
 
             acc_cmd_wind = np.zeros(3, dtype=float)
             acc_cmd_wind[0] = mppi_ctrl_input[0]
+            kp_v = self.cfg.path_following.guidance_tuning.mppi_speed_kp
+            if kp_v > 0.0 and speed_ref >= 0.0:
+                acc_cmd_wind[0] += kp_v * (speed_ref - speed_mag)
+            kg = self.cfg.path_following.guidance_tuning.mppi_speed_guard_kp
+            if kg > 0.0 and speed_ref >= 0.0:
+                margin = self.cfg.path_following.guidance_tuning.mppi_speed_guard_margin
+                acc_cmd_wind[0] = min(acc_cmd_wind[0], kg * (speed_ref + margin - speed_mag))
 
             vec_to_target_ned = virtual_target_ned - position_ned
             vec_to_target_wind = dcm_ned_to_wind @ vec_to_target_ned
@@ -1133,6 +1363,108 @@ class PathFollowingCore:
 
         return acc_cmd_ned, int(guid_type), int(interrupt_prev), int(reset_mppi)
 
+    @staticmethod
+    def _point_along_path(
+        path_waypoints: np.ndarray, passed_wp_idx: int, start_ned: np.ndarray, s: float
+    ) -> np.ndarray | None:
+        # point at arc length s ahead of start_ned (on segment passed_wp_idx), None past the end
+        num_waypoints = int(path_waypoints.shape[0])
+        i = int(np.clip(passed_wp_idx, 0, num_waypoints - 2)) + 1
+        p = np.asarray(start_ned, dtype=float)
+        while i < num_waypoints:
+            seg = path_waypoints[i] - p
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len >= s:
+                return p + seg * (s / max(seg_len, 1e-9))
+            s -= seg_len
+            p = path_waypoints[i]
+            i += 1
+        return None
+
+    def _curvature_feedforward(
+        self, path_waypoints: np.ndarray, passed_wp_idx: int, closest_point_ned: np.ndarray,
+        speed: float, tuning: "GuidanceTuningConfig",
+    ) -> np.ndarray:
+        # centripetal acceleration v^2 * kappa * n from a central second difference of
+        # three arc-length-spaced path points, centred lead_s ahead of the closest point
+        h = max(1.0, 0.15 * speed)
+        s0 = max(speed * tuning.curvature_ff_lead_s - h, 0.0)
+        pts = [self._point_along_path(path_waypoints, passed_wp_idx, closest_point_ned, s0 + k * h)
+               for k in range(3)]
+        if any(q is None for q in pts):
+            return np.zeros(3, dtype=float)
+        acc = tuning.curvature_ff_gain * speed * speed * (pts[0] - 2.0 * pts[1] + pts[2]) / (h * h)
+        acc[2] = 0.0   # horizontal only: altitude kinks between replans are not real curvature
+        a_mag = float(np.linalg.norm(acc))
+        if tuning.curvature_ff_max_accel > 0.0 and a_mag > tuning.curvature_ff_max_accel:
+            acc = acc * (tuning.curvature_ff_max_accel / a_mag)
+        return acc
+
+    @staticmethod
+    def _corner_geometry(
+        path_waypoints: np.ndarray, k: int, tuning: "GuidanceTuningConfig"
+    ) -> tuple[float, float] | None:
+        # (corner speed v_c, turn start before the vertex d) at interior vertex k, None if it is
+        # (almost) straight; horizontal geometry only (GuidanceTuningConfig.corner_speed_enable).
+        # mppi_kernel.cu corner_geom_ is the same computation.
+        n = int(path_waypoints.shape[0])
+        if k < 1 or k > n - 2:
+            return None
+        d1 = path_waypoints[k, :2] - path_waypoints[k - 1, :2]
+        d2 = path_waypoints[k + 1, :2] - path_waypoints[k, :2]
+        l1 = float(np.hypot(d1[0], d1[1]))
+        l2 = float(np.hypot(d2[0], d2[1]))
+        if l1 < 1e-3 or l2 < 1e-3:
+            return None
+        dpsi = math.acos(float(np.clip(np.dot(d1, d2) / (l1 * l2), -1.0, 1.0)))
+        if dpsi < math.radians(tuning.corner_min_angle_deg):
+            return None
+        half = 0.5 * dpsi
+        radius = tuning.corner_max_error_m / max(1.0 - math.cos(half), 1e-6)
+        tan_half = max(math.tan(half), 1e-6)
+        d_turn = radius * tan_half
+        d_max = 0.5 * min(l1, l2)
+        if d_turn > d_max:
+            d_turn = d_max
+            radius = d_turn / tan_half
+        return max(math.sqrt(tuning.corner_lat_accel_mps2 * radius), tuning.corner_min_speed_mps), d_turn
+
+    def _corner_speed_limit(
+        self, path_waypoints: np.ndarray, passed_wp_idx: int, closest_point_ned: np.ndarray,
+        speed_cap: float, tuning: "GuidanceTuningConfig",
+    ) -> float:
+        # speed allowed by the corners around the closest point (see corner_speed_enable):
+        # the vertex just passed (second half of its turn) and the ones ahead within braking range
+        n = int(path_waypoints.shape[0])
+        i = int(np.clip(passed_wp_idx, 0, n - 2))
+        a = tuning.corner_brake_accel_mps2
+        v_lim = math.inf
+        geo = self._corner_geometry(path_waypoints, i, tuning)
+        if geo is not None:
+            s_back = float(np.hypot(*(closest_point_ned[:2] - path_waypoints[i, :2])))
+            v_lim = min(v_lim, math.sqrt(geo[0] ** 2 + 2.0 * a * max(s_back - geo[1], 0.0)))
+        s = float(np.hypot(*(path_waypoints[i + 1, :2] - closest_point_ned[:2])))
+        s_reach = max(speed_cap, 0.0) ** 2 / (2.0 * a) + 50.0
+        for k in range(i + 1, n - 1):
+            geo = self._corner_geometry(path_waypoints, k, tuning)
+            if geo is not None:
+                v_lim = min(v_lim, math.sqrt(geo[0] ** 2 + 2.0 * a * max(s - geo[1], 0.0)))
+            s += float(np.hypot(*(path_waypoints[k + 1, :2] - path_waypoints[k, :2])))
+            if s > s_reach:
+                break
+        return v_lim
+
+    @staticmethod
+    def _remaining_path_length(
+        path_waypoints: np.ndarray, passed_wp_idx: int, closest_point_ned: np.ndarray
+    ) -> float:
+        num_waypoints = int(path_waypoints.shape[0])
+        i = int(np.clip(passed_wp_idx, 0, num_waypoints - 2))
+        remaining = float(np.linalg.norm(path_waypoints[i + 1] - closest_point_ned))
+        if i + 1 < num_waypoints - 1:
+            remaining += float(np.sum(np.linalg.norm(np.diff(path_waypoints[i + 1:], axis=0), axis=1)))
+        return remaining
+
     def _convert_acc_cmd_to_thrust_and_att_cmd(
         self,
         dcm_ned_to_body: np.ndarray,
@@ -1146,9 +1478,28 @@ class PathFollowingCore:
         yaw_cmd_limit_rad: float,
         max_tilt_rad: float,
     ) -> tuple[float, float, np.ndarray]:
-        acc_cmd_mag = np.linalg.norm(acc_cmd_ned)
-        acc_cmd_body = dcm_ned_to_body @ acc_cmd_ned
-        thrust_cmd_total = min(abs(acc_cmd_body[2]) * mass, max_total_thrust)
+        if self.cfg.path_following.guidance_tuning.vertical_priority:
+            gravity = self.cfg.model.gravity
+            f_up = max(-float(acc_cmd_ned[2]), 0.2 * gravity)
+            f_h = np.asarray(acc_cmd_ned[:2], dtype=float)
+            f_max = max_total_thrust / mass
+            h_max = f_up * math.tan(max_tilt_rad)
+            h_max = min(h_max, math.sqrt(f_max * f_max - f_up * f_up)) if f_max > f_up else 0.0
+            h = float(np.linalg.norm(f_h))
+            if h > h_max:
+                f_h = f_h * (h_max / h)
+            acc_cmd_ned = np.array([f_h[0], f_h[1], -f_up], dtype=float)
+            acc_cmd_mag = np.linalg.norm(acc_cmd_ned)
+            thrust_cmd_total = min(acc_cmd_mag * mass, max_total_thrust)
+        else:
+            acc_cmd_mag = np.linalg.norm(acc_cmd_ned)
+            acc_cmd_body = dcm_ned_to_body @ acc_cmd_ned
+            # Thrust acts along -z_body. The legacy abs() turned a commanded downward body
+            # acceleration (wanting to sink faster than gravity) into FULL upward thrust - a
+            # runaway climb once the vertical velocity error got large (v10h: 152 m). Keep the
+            # sign; floor at 0.2 g so the attitude loop keeps some authority.
+            thrust_cmd_total = min(max(-acc_cmd_body[2] * mass, 0.2 * mass * self.cfg.model.gravity),
+                                   max_total_thrust)
         thrust_cmd_norm = thrust_cmd_total / max(max_total_thrust, self.cfg.numerics.eps)
 
         heading_wp_ned = path_waypoints[heading_wp_idx]
@@ -1162,6 +1513,23 @@ class PathFollowingCore:
             path_segment = heading_wp_ned - prev_wp_ned
             yaw_des, _ = azim_elev_from_vec3(path_segment)
 
+        tuning = self.cfg.path_following.guidance_tuning
+        if tuning.yaw_mode == "hold":
+            if self._yaw_hold_rad is None:
+                self._yaw_hold_rad = float(euler_rpy[2])
+            yaw_des = self._yaw_hold_rad
+        elif tuning.yaw_mode == "velocity":
+            v = self.state.velocity_ned
+            if math.hypot(float(v[0]), float(v[1])) > tuning.yaw_min_speed:
+                yaw_des = math.atan2(float(v[1]), float(v[0]))
+            else:
+                yaw_des = float(euler_rpy[2]) if self._yaw_cmd_prev is None else self._yaw_cmd_prev
+        if tuning.yaw_rate_limit_deg > 0.0:
+            prev = float(euler_rpy[2]) if self._yaw_cmd_prev is None else self._yaw_cmd_prev
+            step = math.radians(tuning.yaw_rate_limit_deg) * self.cfg.path_following.dt_pf
+            d_yaw = (yaw_des - prev + math.pi) % (2.0 * math.pi) - math.pi
+            yaw_des = prev + max(min(d_yaw, step), -step)
+        self._yaw_cmd_prev = (yaw_des + math.pi) % (2.0 * math.pi) - math.pi
         yaw_error = (yaw_des - euler_rpy[2] + math.pi) % (2.0 * math.pi) - math.pi
         yaw_error = max(min(yaw_error, yaw_cmd_limit_rad), -yaw_cmd_limit_rad)
         yaw_des = euler_rpy[2] + yaw_error
@@ -1221,6 +1589,12 @@ class PathFollowingCore:
         disturbance_est[2] = observer_state[2] + gains[2] * velocity_ned[2]
 
         self.ndo.observer_state_ned = observer_state + observer_state_dot * dt
+        # bound the estimate: ground contact / thrust saturation read as huge
+        # 'disturbances' and the compensation then overshoots after release
+        ndo_max = self.cfg.path_following.guidance_tuning.ndo_max_accel
+        d_norm = float(np.linalg.norm(disturbance_est))
+        if ndo_max > 0.0 and d_norm > ndo_max:
+            disturbance_est = disturbance_est * (ndo_max / d_norm)
         self.ndo.disturbance_acc_ned = disturbance_est
 
     # =====================================================
@@ -1268,6 +1642,8 @@ class PathFollowingCore:
                 virtual_target=self.path.virtual_target_ned,
                 closest_point=self.path.closest_point_ned,
                 ndo=self.ndo.disturbance_acc_ned,
+                speed_ref=float(self.path.speed_ref),
+                lookahead=float(self.path.lookahead),
             )
         except Exception:
             pass

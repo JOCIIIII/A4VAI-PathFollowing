@@ -28,7 +28,7 @@ node_pathfollowing:
       spin_direction: [-1, 1, -1, 1]
 
     px4_model:
-      max_tilt_deg: 30.0
+      max_tilt_deg: 35.0
       max_accel_xy: 4.0
       max_accel_z: 2.5      
       tau_phi: 0.3

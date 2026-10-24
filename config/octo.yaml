@@ -17,7 +17,10 @@ node_pathfollowing:
 
     actuator:
       n_motor: 8
-      max_thrust_per_rotor: 117.48375
+      # A4VAI X8 Gazebo model (PX4-SITL-Runner scripts/px4/x8): PF's thrust is linear in the
+      # normalised command; 28.72 N makes 10.4 kg hover at the model's normalised hover thrust
+      # 0.444 (THR_MDL_FAC 0.3, PWM 1100-1900). The old 117.48 was the 1.5e-4 * 885^2 motor.
+      max_thrust_per_rotor: 28.72
       # torque_coefficient: 0.02
       # thrust_coefficient: 1.0
       rotor_positions:
@@ -32,13 +35,17 @@ node_pathfollowing:
       spin_direction: [1, 1, -1, -1, -1, -1, 1, 1]
       
     px4_model:
-      max_tilt_deg: 30.0
+      max_tilt_deg: 35.0
       max_accel_xy: 4.0
       max_accel_z: 2.5      
       tau_phi: 0.3
       tau_the: 0.3
       tau_psi: 0.6
-      del_psi_cmd_limit_deg: 20.0
+      # yaw command = current yaw + this at most; PX4 turns it into MC_YAW_P x error. The X8's
+      # MC_YAW_P is 6.1 (vehicle), so 20 deg asked for 122 deg/s and the slow-yawing octo kept
+      # chasing the heading (yaw-rate setpoint std 61-127 deg/s vs 16-19 on the iris). 7.5 deg
+      # caps it at ~46 deg/s, the vehicle's own auto-mode yaw rate (MPC_YAWRAUTO_MAX 45).
+      del_psi_cmd_limit_deg: 7.5
       tau_wb: 0.05
       tau_p: 0.1
       tau_q: 0.1

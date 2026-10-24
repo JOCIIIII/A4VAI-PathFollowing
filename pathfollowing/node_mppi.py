@@ -20,11 +20,22 @@ from std_msgs.msg import Float32, Float32MultiArray, Int32MultiArray
 from .core.core_mppi import MPPICore
 
 
+# per-launch overrides of the corner speed limit (as node_pathfollowing.CORNER_FLOAT_PARAMS)
+CORNER_FLOAT_PARAMS = (
+    ('corner_lat_accel_mps2', 4.0),
+    ('corner_max_error_m', 1.5),
+    ('corner_brake_accel_mps2', 3.0),
+    ('corner_min_speed_mps', 1.0),
+    ('corner_min_angle_deg', 10.0),
+)
+
+
 class NodeMPPI(Node):
     def __init__(self):
         super().__init__('node_mppi')
 
-        sim_cfg = self._load_yaml('sim.yaml')
+        # config file of this run (default sim.yaml): e.g. sim_ca_mppi.yaml for the learned CA + MPPI
+        sim_cfg = self._load_yaml(str(self.declare_parameter('sim_yaml', 'sim.yaml').value))
 
         self.declare_parameter('vehicle_type')
         self.declare_parameter('guid_type')
@@ -41,6 +52,34 @@ class NodeMPPI(Node):
         )
         vehicle_yaml = 'quad.yaml' if vehicle_type == 1 else 'octo.yaml'
         vehicle_cfg = self._load_yaml(vehicle_yaml)
+        # the sim yaml may override vehicle-model entries per vehicle file (sim_ca_mppi.yaml: the
+        # MPPI rollout's attitude time constants): {quad|octo: {section: {key: value}}}
+        overrides = (sim_cfg.get('vehicle_override') or {}).get(vehicle_yaml.split('.')[0]) or {}
+        for section, values in overrides.items():
+            if isinstance(values, dict) and isinstance(vehicle_cfg.get(section), dict):
+                vehicle_cfg[section].update(values)
+        # real vehicle: the normalised hover thrust measured on it (PX4 hover thrust estimate in
+        # its log) sets the thrust scale - only mass*g/(n_motor*max_thrust_per_rotor) enters the
+        # thrust command, the disturbance observer and the MPPI rollout - and its tilt limit
+        # replaces max_tilt_deg. 0 = keep the yaml. Give node_pathfollowing and node_mppi the same.
+        hover_thrust = float(self.declare_parameter('hover_thrust', 0.0).value)
+        if hover_thrust > 0.0:
+            model, actuator = vehicle_cfg['model'], vehicle_cfg['actuator']
+            actuator['max_thrust_per_rotor'] = (
+                float(model['mass']) * float(model['gravity']) / (int(actuator['n_motor']) * hover_thrust))
+        max_tilt_deg = float(self.declare_parameter('max_tilt_deg', 0.0).value)
+        if max_tilt_deg > 0.0:
+            vehicle_cfg['px4_model']['max_tilt_deg'] = max_tilt_deg
+
+        # corner speed limit / rollout = PF guidance: same per-launch parameters as
+        # node_pathfollowing (see core_pathfollowing.GuidanceTuningConfig)
+        pf_cfg = sim_cfg.get('path_following', {})
+        tuning_cfg = pf_cfg.get('guidance_tuning', pf_cfg) if isinstance(pf_cfg, dict) else {}
+        if isinstance(tuning_cfg, dict):
+            for name in ('corner_speed_enable', 'mppi_rollout_sync'):
+                tuning_cfg[name] = bool(self.declare_parameter(name, bool(tuning_cfg.get(name, False))).value)
+            for name, default in CORNER_FLOAT_PARAMS:
+                tuning_cfg[name] = float(self.declare_parameter(name, float(tuning_cfg.get(name, default))).value)
 
         self.core = MPPICore(
             guid_type=guid_type,

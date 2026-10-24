@@ -1,0 +1,171 @@
+############################################################
+#
+#   - Name : sim_ca_mppi.yaml
+#
+#   sim.yaml for the learned collision-avoidance policy (noclimb CA) flown through MPPI
+#   guidance (guid_type 2). Differences from sim.yaml, all marked below:
+#     - MPPI explores the forward acceleration with sigma 0.5 m/s^2 (sim.yaml 0.045: from rest
+#       a 2 m/s command was still at 0.3 m/s after 10 s) and the guidance gain with 0.3, 2048
+#       samples (0.8 / 1024 left 1.5 m/s^2 of 2-5 Hz jitter in u0: pitch wobble); inputs bounded (|u0| <= 4 m/s^2, gain 0.5-4), nominal sequences smoothed,
+#       applied output rate-limited and low-passed - unshaped, sigma 1.5 drove u0 to +-20 m/s^2
+#     - horizon 2 s: the policy re-sends a ~15 m path every 50 ms; 5 s at 5 m/s ran off it
+#     - MPPI engages on speed, nose along the velocity (rate-limited), vertical priority
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    vehicle_type: 1
+    # 1: quad, 2: octa
+
+    guid_type: 2
+    # 0: Pos. Ctrl, 1: MPPI-GL (original cost), 2: MPPI-GL (cruise speed control)
+    
+    wp_type: 0
+    # 0: path planning solution, 1: straight line, 2: rectangle
+    # 3: zigzag, 4: circle, 5: figure-8
+    # 6: Alt change, 7: Spiral, 8: Lissajous curve (figure 8)
+
+    path_following:
+      dt_pf: 0.004
+      # cruise speed for MPPI (guid 1/2, e.g. run-pf-test.sh). The SUPER pipeline (guid 0
+      # speed mode) is driven by /desired_speed from super_pf_bridge instead.
+      desired_speed: 1.5
+      # pursuit lookahead floor (speed mode grows it as speed * lookahead_time_s). 4.5 m cut
+      # the inside of SUPER's tight avoidance curves by ~0.5 m at low speed.
+      lookahead_distance: 2.0
+      waypoint_switch_distance: 4.5
+
+      # guid type = 0
+      kp_vel: 1.0
+      kd_vel: 0.0
+
+      # legacy speed-guidance params (currently unused in core)
+      kp_speed: 3.0
+      kd_speed: 0.0
+      guid_eta: 2.0
+
+      # guidance transition / geometry tuning
+      final_wp_tolerance_m: 0.5
+      transition_speed_threshold_mps: 1.0
+      position_kp: 0.5
+      position_kv_multiplier: 5.0
+      min_guid_eta: 0.5
+      gl_vertical_speed_gain: 2.0
+
+      # guid type = 0, speed-regulated pursuit (inhousesim 10 m/s):
+      # |v_cmd| = desired_speed (or /desired_speed), capped by sqrt(2*brake*remaining
+      # path); direction = toward the lookahead target, which grows with speed.
+      pos_speed_mode: true
+      lookahead_time_s: 0.6
+      lookahead_max_m: 10.0
+      brake_accel_mps2: 4.0
+      # tracking at speed: the vehicle trailed on the OUTSIDE of SUPER's curves
+      # (velocity-loop lag, no feed-forward). Add the path's horizontal centripetal
+      # acceleration (gain*v^2*kappa, 0.3 s ahead, <= 4 m/s^2) and a 0.5 1/s cross-track
+      # pull that also works when the speed reference is ~0 (stopping on a replan).
+      # gain 1.0 over-corrected to the inside of turns (69%, +0.12 m) - i.e. toward the
+      # obstacle on avoidance bends -> 0.7.
+      curvature_ff_gain: 0.7
+      curvature_ff_lead_s: 0.3
+      curvature_ff_max_accel: 4.0
+      xt_gain: 0.5
+      # cap on the disturbance-observer estimate [m/s^2] (ground contact / saturation)
+      ndo_max_accel: 4.0
+      # only hand over to landing once (almost) stopped at the goal
+      done_speed_max: 0.3
+      # after overshooting the path end, return to it at <= 1 m/s (kp * distance)
+      terminal_speed_max: 1.0
+      mppi_speed_transition: true   # sim_ca_mppi
+      yaw_mode: velocity            # sim_ca_mppi: nose along the direction of travel
+      yaw_rate_limit_deg: 90.0      # sim_ca_mppi
+      vertical_priority: true       # sim_ca_mppi
+      mppi_output_tau_s: 0.15       # sim_ca_mppi
+      mppi_max_heading_error_deg: 90.0   # sim_ca_mppi: pursuit for sharp turns / reversals
+      mppi_speed_kp: 1.0            # sim_ca_mppi: speed feedback on top of MPPI's u0 [1/s]
+      mppi_speed_guard_kp: 2.0      # sim_ca_mppi: speed cap min(acc, kp*(ref+margin-v)) [1/s]
+      mppi_speed_guard_margin: 0.1  # sim_ca_mppi: [m/s]
+
+    # guid type = 1,2
+    mppi:
+      dt_mppi: 0.05
+      num_samples: 2048          # sim_ca_mppi (sim.yaml 512)
+      horizon_steps: 40          # sim_ca_mppi: 2 s (sim.yaml 100)
+      cost_min_v_aligned: 0.3
+      use_gpr_forecast: true
+
+      # rollout tuning
+      type2_gamma_scale: 0.05
+      disturbance_var_weight_gain: 40.0
+      disturbance_var_clip: 5.0e-4
+      cost_path_error_scale_m: 5.0
+      gpr_var_bias: 1.0e-2
+      gpr_var_clip: 1.0
+      u0_bound: 4.0               # sim_ca_mppi: input shaping (see MPPIRolloutTuningConfig)
+      u1_max: 4.0
+      smooth_window: 9
+      output_rate_u0: 10.0
+      output_rate_u1: 10.0
+      speed_norm_floor: 2.0       # sim_ca_mppi: stop (ref 0) keeps a gradient
+      noise_corr_tau_s: 0.5       # sim_ca_mppi: correlated exploration (see MPPIRolloutTuningConfig)
+      lambda_quantile: 0.05       # sim_ca_mppi: best 5% of the samples share the update
+
+      # guid type = 1
+      type_1:
+        state_cost: [0.01, 0.01, 0.01]      # Q
+        terminal_cost: [0.05, 0.05, 0.05]   # P
+        noise_std_u0_scale: 0.7
+        noise_std_u1_scale: 0.7
+        lambda_weight: 0.000245
+        u0_init: 0.5
+        u1_init: 2.0
+
+      # guid type = 2
+      type_2:
+        state_cost: [75.0, 100.0, 5.0]      # Q  (sim_ca_mppi: speed 100, sim.yaml 50)
+        terminal_cost: [0.0, 100.0, 5.0]    # P
+        noise_std_u0_scale: 0.5     # sim_ca_mppi (sim.yaml 0.0447)
+        noise_std_u1_scale: 0.3     # sim_ca_mppi (sim.yaml 0.0894)
+        lambda_weight: 0.1
+        u0_init: 0.0
+        u1_init: 2.0
+
+
+    ndo:
+      gain: [5.0, 5.0, 5.0]
+
+    numerics:
+      eps: 1.0e-9
+
+    gpr:
+      dt_gpr: 0.01
+      dt_gpr_opt_mul: 20
+      forecast_steps: 2000
+
+      measurement_matrix: [1.0, 0.0]
+
+      meas_noise_var_x: 1.0e-6
+      meas_noise_var_y: 1.0e-6
+
+      hyp_l_init: [1.0, 1.0]
+      hyp_q_init: [1.0, 1.0]
+      hyp_n: 500
+
+      hyp_l_min: 1.0e-2
+      hyp_l_max: 0.5
+      hyp_q_min: 1.0e-2
+      hyp_q_max: 0.5
+
+      lpf_cutoff_hz: 5
+    # sim_ca_mppi: vehicle-model entries for the MPPI rollout (merged into quad/octo.yaml)
+    # per vehicle file: the attitude loop is ~1/MC_ROLL_P, MC_PITCH_P of the airframe; the 0.3 s
+    # of quad.yaml / octo.yaml made the rollout model slower than the vehicle and MPPI over-command
+    vehicle_override:
+      quad:               # iris (PX4 10015): MC_ROLL_P / MC_PITCH_P 6.5
+        px4_model:
+          tau_phi: 0.15
+          tau_the: 0.15
+      octo:               # A4VAI X8 (airframe 2000): MC_ROLL_P 5.2, MC_PITCH_P 5.5
+        px4_model:
+          tau_phi: 0.19
+          tau_the: 0.18

@@ -15,7 +15,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
 
-from std_msgs.msg import Float32MultiArray, Float64MultiArray, Int32MultiArray, Bool, Int32
+from std_msgs.msg import Float32, Float32MultiArray, Float64MultiArray, Int32MultiArray, Bool, Int32
 
 from px4_msgs.msg import VehicleLocalPosition
 from px4_msgs.msg import VehicleAttitude
@@ -30,11 +30,22 @@ from .core.core_pathfollowing import PathFollowingCore
 from .utils.logger import logger
 
 
+# per-launch overrides of the corner speed limit (defaults as GuidanceTuningConfig)
+CORNER_FLOAT_PARAMS = (
+    ('corner_lat_accel_mps2', 4.0),
+    ('corner_max_error_m', 1.5),
+    ('corner_brake_accel_mps2', 3.0),
+    ('corner_min_speed_mps', 1.0),
+    ('corner_min_angle_deg', 10.0),
+)
+
+
 class NodePathFollowing(Node):
     def __init__(self):
         super().__init__('node_pathfollowing')
 
-        sim_cfg = self._load_yaml('sim.yaml')
+        # config file of this run (default sim.yaml): e.g. sim_ca_mppi.yaml for the learned CA + MPPI
+        sim_cfg = self._load_yaml(str(self.declare_parameter('sim_yaml', 'sim.yaml').value))
 
         # =====================================================
         # parameters
@@ -67,6 +78,39 @@ class NodePathFollowing(Node):
 
         vehicle_yaml = 'quad.yaml' if vehicle_type == 1 else 'octo.yaml'
         vehicle_cfg = self._load_yaml(vehicle_yaml)
+        # the sim yaml may override vehicle-model entries per vehicle file (sim_ca_mppi.yaml: the
+        # MPPI rollout's attitude time constants): {quad|octo: {section: {key: value}}}
+        overrides = (sim_cfg.get('vehicle_override') or {}).get(vehicle_yaml.split('.')[0]) or {}
+        for section, values in overrides.items():
+            if isinstance(values, dict) and isinstance(vehicle_cfg.get(section), dict):
+                vehicle_cfg[section].update(values)
+        # real vehicle: the normalised hover thrust measured on it (PX4 hover thrust estimate in
+        # its log) sets the thrust scale - only mass*g/(n_motor*max_thrust_per_rotor) enters the
+        # thrust command, the disturbance observer and the MPPI rollout - and its tilt limit
+        # replaces max_tilt_deg. 0 = keep the yaml. Give node_pathfollowing and node_mppi the same.
+        hover_thrust = float(self.declare_parameter('hover_thrust', 0.0).value)
+        if hover_thrust > 0.0:
+            model, actuator = vehicle_cfg['model'], vehicle_cfg['actuator']
+            actuator['max_thrust_per_rotor'] = (
+                float(model['mass']) * float(model['gravity']) / (int(actuator['n_motor']) * hover_thrust))
+        max_tilt_deg = float(self.declare_parameter('max_tilt_deg', 0.0).value)
+        if max_tilt_deg > 0.0:
+            vehicle_cfg['px4_model']['max_tilt_deg'] = max_tilt_deg
+
+        # per-launch override of path_following.vertical_priority (see GuidanceTuningConfig)
+        pf_cfg = sim_cfg.get('path_following', {})
+        tuning_cfg = pf_cfg.get('guidance_tuning', pf_cfg) if isinstance(pf_cfg, dict) else {}
+        if isinstance(tuning_cfg, dict):
+            for name in ('vertical_priority', 'mppi_speed_transition', 'yaw_hold'):
+                tuning_cfg[name] = bool(self.declare_parameter(name, bool(tuning_cfg.get(name, False))).value)
+            tuning_cfg['yaw_mode'] = str(self.declare_parameter(
+                'yaw_mode', str(tuning_cfg.get('yaw_mode', 'hold' if tuning_cfg.get('yaw_hold') else 'waypoint'))).value)
+            # corner speed limit / rollout = PF guidance (GuidanceTuningConfig); node_mppi takes
+            # the same parameters - give both nodes the same values (pf_test.sh PF_TEST_CORNER)
+            for name in ('corner_speed_enable', 'mppi_rollout_sync'):
+                tuning_cfg[name] = bool(self.declare_parameter(name, bool(tuning_cfg.get(name, False))).value)
+            for name, default in CORNER_FLOAT_PARAMS:
+                tuning_cfg[name] = float(self.declare_parameter(name, float(tuning_cfg.get(name, default))).value)
 
         # =====================================================
         # core
@@ -180,6 +224,15 @@ class NodePathFollowing(Node):
             Int32,
             '/path_following/set_guid_type',
             self._guid_type_callback,
+            10,
+        )
+
+        # Runtime cruise-speed override (same topic node_mppi listens to); used by
+        # the speed-regulated guid 0 law (path_following.pos_speed_mode).
+        self.desired_speed_subscription = self.create_subscription(
+            Float32,
+            '/desired_speed',
+            self._desired_speed_callback,
             10,
         )
 
@@ -436,6 +489,9 @@ class NodePathFollowing(Node):
 
     def _guid_type_callback(self, msg: Int32) -> None:
         self.core.update_guid_type(int(msg.data))
+
+    def _desired_speed_callback(self, msg: Float32) -> None:
+        self.core.update_desired_speed(float(msg.data))
 
     # =====================================================
     # timer callbacks

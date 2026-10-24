@@ -25,6 +25,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', [
             'config/sim.yaml',
+            'config/sim_ca_mppi.yaml',
+            'config/sim_ca_mppi_x8.yaml',
             'config/quad.yaml',
             'config/octo.yaml',
         ]),

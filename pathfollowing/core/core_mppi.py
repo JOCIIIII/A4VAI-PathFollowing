@@ -179,6 +179,23 @@ class GuidanceTuningConfig:
     position_kv_multiplier: float
     min_guid_eta: float
     gl_vertical_speed_gain: float
+    mppi_max_heading_error_deg: float = 0.0   # see core_pathfollowing.GuidanceTuningConfig
+    mppi_speed_kp: float = 0.0                # see core_pathfollowing.GuidanceTuningConfig
+    mppi_speed_guard_kp: float = 0.0          # see core_pathfollowing.GuidanceTuningConfig
+    mppi_speed_guard_margin: float = 0.3
+    # corner speed limit and rollout = PF guidance, see core_pathfollowing.GuidanceTuningConfig
+    # (corner_speed_enable, mppi_rollout_sync); the PF's lookahead law and end braking are
+    # needed here only for mppi_rollout_sync
+    corner_speed_enable: bool = False
+    corner_lat_accel_mps2: float = 4.0
+    corner_max_error_m: float = 1.5
+    corner_brake_accel_mps2: float = 3.0
+    corner_min_speed_mps: float = 1.0
+    corner_min_angle_deg: float = 10.0
+    mppi_rollout_sync: bool = False
+    lookahead_time_s: float = 0.0
+    lookahead_max_m: float = 0.0
+    brake_accel_mps2: float = 0.0
 
     @classmethod
     def from_dict(
@@ -213,6 +230,20 @@ class GuidanceTuningConfig:
             raise RuntimeError(f"[FATAL] {scope} eta/vertical gain must be > 0.")
 
         return cls(
+            mppi_max_heading_error_deg=max(float(cfg.get("mppi_max_heading_error_deg", 0.0)), 0.0),
+            mppi_speed_kp=max(float(cfg.get("mppi_speed_kp", 0.0)), 0.0),
+            mppi_speed_guard_kp=max(float(cfg.get("mppi_speed_guard_kp", 0.0)), 0.0),
+            mppi_speed_guard_margin=max(float(cfg.get("mppi_speed_guard_margin", 0.3)), 0.0),
+            corner_speed_enable=bool(cfg.get("corner_speed_enable", False)),
+            corner_lat_accel_mps2=max(float(cfg.get("corner_lat_accel_mps2", 4.0)), 0.1),
+            corner_max_error_m=max(float(cfg.get("corner_max_error_m", 1.5)), 0.05),
+            corner_brake_accel_mps2=max(float(cfg.get("corner_brake_accel_mps2", 3.0)), 0.1),
+            corner_min_speed_mps=max(float(cfg.get("corner_min_speed_mps", 1.0)), 0.0),
+            corner_min_angle_deg=max(float(cfg.get("corner_min_angle_deg", 10.0)), 0.1),
+            mppi_rollout_sync=bool(cfg.get("mppi_rollout_sync", False)),
+            lookahead_time_s=max(float(cfg.get("lookahead_time_s", 0.0)), 0.0),
+            lookahead_max_m=max(float(cfg.get("lookahead_max_m", 0.0)), 0.0),
+            brake_accel_mps2=max(float(cfg.get("brake_accel_mps2", 0.0)), 0.0),
             final_wp_tolerance_m=final_wp_tolerance_m,
             transition_speed_threshold_mps=transition_speed_threshold_mps,
             position_kp=position_kp,
@@ -316,6 +347,23 @@ class MPPIRolloutTuningConfig:
     cost_path_error_scale_m: float
     gpr_var_bias: float
     gpr_var_clip: float
+    # Optional input shaping (all off by default = the original solver). u0 is the forward
+    # acceleration [m/s^2], u1 the guidance gain. Without bounds/smoothing a fast-changing path
+    # (learned CA re-sending it at 20 Hz) drove u0 to +-20 m/s^2 and u1 negative.
+    u0_bound: float = 0.0          # |u0| <= bound in rollouts and output (0 = unbounded)
+    u1_max: float = 0.0            # min_guid_eta <= u1 <= u1_max (0 = unbounded)
+    smooth_window: int = 1         # moving average over the nominal sequences after each update
+    output_rate_u0: float = 0.0    # max change of the applied u0 per second (0 = none)
+    output_rate_u1: float = 0.0    # same for u1
+    speed_norm_floor: float = 0.0  # speed error / max(ref, floor) [m/s]; 0 = original (ref only)
+    # Exploration and weighting. With white per-step noise a sample barely changes its speed
+    # within the horizon, and with a small lambda the update is the single best sample's noise:
+    # u0 random-walked (+-0.2 per solve, no drift toward the speed reference) and showed up as
+    # pitch-setpoint jitter. noise_corr_tau_s: AR(1) correlation of the noise along the horizon
+    # (same per-step std) [s]; lambda_quantile: temperature = max(lambda, cost at this quantile -
+    # min cost), i.e. the best q of the samples share the update. 0 = off (original).
+    noise_corr_tau_s: float = 0.0
+    lambda_quantile: float = 0.0
 
     @classmethod
     def from_dict(
@@ -366,6 +414,14 @@ class MPPIRolloutTuningConfig:
             cost_path_error_scale_m=cost_path_error_scale_m,
             gpr_var_bias=gpr_var_bias,
             gpr_var_clip=gpr_var_clip,
+            u0_bound=max(float(cfg.get("u0_bound", 0.0)), 0.0),
+            u1_max=max(float(cfg.get("u1_max", 0.0)), 0.0),
+            smooth_window=max(int(cfg.get("smooth_window", 1)), 1),
+            output_rate_u0=max(float(cfg.get("output_rate_u0", 0.0)), 0.0),
+            output_rate_u1=max(float(cfg.get("output_rate_u1", 0.0)), 0.0),
+            speed_norm_floor=max(float(cfg.get("speed_norm_floor", 0.0)), 0.0),
+            noise_corr_tau_s=max(float(cfg.get("noise_corr_tau_s", 0.0)), 0.0),
+            lambda_quantile=min(max(float(cfg.get("lambda_quantile", 0.0)), 0.0), 1.0),
         )
 
 
@@ -846,6 +902,24 @@ class MPPICore:
                 float(rt.cost_path_error_scale_m),
                 float(rt.gpr_var_bias),
                 float(rt.gpr_var_clip),
+                float(rt.u0_bound),
+                float(rt.u1_max),
+                float(rt.speed_norm_floor),
+                float(math.radians(gt.mppi_max_heading_error_deg)),
+                float(gt.mppi_speed_kp),
+                float(gt.mppi_speed_guard_kp),
+                float(gt.mppi_speed_guard_margin),
+                # 54-63: corner speed limit / rollout = PF guidance (mppi_kernel.cu)
+                1.0 if gt.corner_speed_enable else 0.0,
+                float(gt.corner_lat_accel_mps2),
+                float(gt.corner_max_error_m),
+                float(gt.corner_brake_accel_mps2),
+                float(gt.corner_min_speed_mps),
+                float(math.radians(gt.corner_min_angle_deg)),
+                1.0 if gt.mppi_rollout_sync else 0.0,
+                float(gt.lookahead_time_s),
+                float(gt.lookahead_max_m),
+                float(gt.brake_accel_mps2),
             ],
             dtype=np.float32,
         )
@@ -969,8 +1043,16 @@ class MPPICore:
             self._const_guid_type = guid_type
 
         self._fill_standard_normal_float32(self.host_delta_u0)
-        self.host_delta_u0 *= float(selected.noise_std_u0_scale)
         self._fill_standard_normal_float32(self.host_delta_u1)
+        tau_n = self.cfg.mppi.rollout_tuning.noise_corr_tau_s
+        if tau_n > 0.0:
+            # rows are horizon steps: AR(1) along them, stationary std 1
+            a = math.exp(-float(self.cfg.mppi.dt_mppi) / tau_n)
+            b = math.sqrt(1.0 - a * a)
+            for arr in (self.host_delta_u0, self.host_delta_u1):
+                for n in range(1, arr.shape[0]):
+                    arr[n] = a * arr[n - 1] + b * arr[n]
+        self.host_delta_u0 *= float(selected.noise_std_u0_scale)
         self.host_delta_u1 *= float(selected.noise_std_u1_scale)
 
         self.host_update[0] = float(self.runtime_flags.wp_idx_heading)
@@ -1024,6 +1106,9 @@ class MPPICore:
         self.host_res_stk -= np.min(self.host_res_stk)
         eps = self.cfg.numerics.eps
         beta = max(float(selected.lambda_weight), eps)
+        q = self.cfg.mppi.rollout_tuning.lambda_quantile
+        if q > 0.0:
+            beta = max(beta, float(np.quantile(self.host_res_stk, q)))
         np.divide(self.host_res_stk, -beta, out=self.host_weight)
         np.exp(self.host_weight, out=self.host_weight)
         eta = float(np.sum(self.host_weight))
@@ -1038,7 +1123,24 @@ class MPPICore:
         self.u0 += self.host_du0
         self.u1 += self.host_du1
 
+        rt = self.cfg.mppi.rollout_tuning
+        if rt.u0_bound > 0.0:
+            np.clip(self.u0, -rt.u0_bound, rt.u0_bound, out=self.u0)
+        if rt.u1_max > 0.0:
+            np.clip(self.u1, self.cfg.path_following.guidance_tuning.min_guid_eta, rt.u1_max, out=self.u1)
+        if rt.smooth_window > 1:
+            w = int(rt.smooth_window)
+            kern = np.ones(w, dtype=np.float32) / w
+            for seq in (self.u0, self.u1):
+                padded = np.concatenate([np.full(w // 2, seq[0]), seq, np.full(w - 1 - w // 2, seq[-1])])
+                seq[:] = np.convolve(padded, kern, mode='valid')
+
         output = np.array([self.u0[0], self.u1[0]], dtype=np.float32)
+        dt = float(self.cfg.mppi.dt_mppi)
+        for i, rate in ((0, rt.output_rate_u0), (1, rt.output_rate_u1)):
+            if rate > 0.0:
+                step = rate * dt
+                output[i] = self.last_output[i] + min(max(output[i] - self.last_output[i], -step), step)
 
         self.u0[:-1] = self.u0[1:]
         self.u1[:-1] = self.u1[1:]

@@ -21,8 +21,12 @@ node_pathfollowing:
 
     path_following:
       dt_pf: 0.004
+      # cruise speed for MPPI (guid 1/2, e.g. run-pf-test.sh). The SUPER pipeline (guid 0
+      # speed mode) is driven by /desired_speed from super_pf_bridge instead.
       desired_speed: 1.5
-      lookahead_distance: 4.5
+      # pursuit lookahead floor (speed mode grows it as speed * lookahead_time_s). 4.5 m cut
+      # the inside of SUPER's tight avoidance curves by ~0.5 m at low speed.
+      lookahead_distance: 2.0
       waypoint_switch_distance: 4.5
 
       # guid type = 0
@@ -38,9 +42,33 @@ node_pathfollowing:
       final_wp_tolerance_m: 0.5
       transition_speed_threshold_mps: 1.0
       position_kp: 0.5
-      position_kv_multiplier: 3.0
+      position_kv_multiplier: 5.0
       min_guid_eta: 0.5
       gl_vertical_speed_gain: 2.0
+
+      # guid type = 0, speed-regulated pursuit (inhousesim 10 m/s):
+      # |v_cmd| = desired_speed (or /desired_speed), capped by sqrt(2*brake*remaining
+      # path); direction = toward the lookahead target, which grows with speed.
+      pos_speed_mode: true
+      lookahead_time_s: 0.6
+      lookahead_max_m: 10.0
+      brake_accel_mps2: 4.0
+      # tracking at speed: the vehicle trailed on the OUTSIDE of SUPER's curves
+      # (velocity-loop lag, no feed-forward). Add the path's horizontal centripetal
+      # acceleration (gain*v^2*kappa, 0.3 s ahead, <= 4 m/s^2) and a 0.5 1/s cross-track
+      # pull that also works when the speed reference is ~0 (stopping on a replan).
+      # gain 1.0 over-corrected to the inside of turns (69%, +0.12 m) - i.e. toward the
+      # obstacle on avoidance bends -> 0.7.
+      curvature_ff_gain: 0.7
+      curvature_ff_lead_s: 0.3
+      curvature_ff_max_accel: 4.0
+      xt_gain: 0.5
+      # cap on the disturbance-observer estimate [m/s^2] (ground contact / saturation)
+      ndo_max_accel: 4.0
+      # only hand over to landing once (almost) stopped at the goal
+      done_speed_max: 0.3
+      # after overshooting the path end, return to it at <= 1 m/s (kp * distance)
+      terminal_speed_max: 1.0
 
     # guid type = 1,2
     mppi:

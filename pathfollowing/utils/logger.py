@@ -60,6 +60,7 @@ class Logger:
                 "vt_x", "vt_y", "vt_z",
                 "closest_x", "closest_y", "closest_z",
                 "ndo_x", "ndo_y", "ndo_z",
+                "speed_ref", "lookahead",
             ])
 
     def update(
@@ -98,6 +99,8 @@ class Logger:
         virtual_target=None,
         closest_point=None,
         ndo=None,
+        speed_ref: float = float("nan"),
+        lookahead: float = float("nan"),
     ) -> None:
         def _vec3(vec):
             if vec is None:
@@ -147,6 +150,7 @@ class Logger:
                 vt_x, vt_y, vt_z,
                 cp_x, cp_y, cp_z,
                 ndo_x, ndo_y, ndo_z,
+                speed_ref, lookahead,
             ])
 
 

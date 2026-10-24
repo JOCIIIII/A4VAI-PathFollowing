@@ -301,6 +301,92 @@ __device__ void vtp_decision_(
     copy3_(closest_on_path, vt);
 }
 
+// corner speed v_c and turn start d (before the vertex) at interior vertex k; v_c = 1e9 for an
+// (almost) straight vertex. Same as core_pathfollowing._corner_geometry (corner_speed_enable).
+__device__ void corner_geom_(
+    const float* wps, int n_wp, int k,
+    float a_lat, float e_max, float v_min, float min_angle,
+    float* vc, float* d_turn
+)
+{
+    *vc = 1.0e9f;
+    *d_turn = 0.0f;
+    if (k < 1 || k > n_wp - 2) return;
+    float p0[3], p1[3], p2[3];
+    get_wp_(wps, k - 1, p0);
+    get_wp_(wps, k, p1);
+    get_wp_(wps, k + 1, p2);
+    float d1x = p1[0] - p0[0], d1y = p1[1] - p0[1];
+    float d2x = p2[0] - p1[0], d2y = p2[1] - p1[1];
+    float l1 = sqrtf(d1x * d1x + d1y * d1y);
+    float l2 = sqrtf(d2x * d2x + d2y * d2y);
+    if (l1 < 1.0e-3f || l2 < 1.0e-3f) return;
+    float dpsi = acosf(clamp_((d1x * d2x + d1y * d2y) / (l1 * l2), -1.0f, 1.0f));
+    if (dpsi < min_angle) return;
+    float half = 0.5f * dpsi;
+    float radius = e_max / fmaxf(1.0f - cosf(half), 1.0e-6f);
+    float tan_half = fmaxf(tanf(half), 1.0e-6f);
+    float d = radius * tan_half;
+    float d_max = 0.5f * fminf(l1, l2);
+    if (d > d_max) {
+        d = d_max;
+        radius = d / tan_half;
+    }
+    *vc = fmaxf(sqrtf(a_lat * radius), v_min);
+    *d_turn = d;
+}
+
+// speed reference of the rollout step: the corner limit (vertex just passed and the ones ahead,
+// as core_pathfollowing._corner_speed_limit) and with end_brake_accel > 0 the PF's end-of-path cap
+// sqrt(2 a remaining) (pos_speed_mode brake_accel_mps2, 3D remaining length)
+__device__ float path_speed_limit_(
+    const float* wps, int n_wp, int wp_idx_passed, const float closest[3], float speed_cap,
+    int corner_on, float a_lat, float e_max, float a_brake, float v_min, float min_angle,
+    float end_brake_accel
+)
+{
+    float v_lim = 1.0e9f;
+    float vc = 0.0f, d = 0.0f;
+    int i = i_clamp_(wp_idx_passed, 0, n_wp - 2);
+    if (corner_on) {
+        corner_geom_(wps, n_wp, i, a_lat, e_max, v_min, min_angle, &vc, &d);
+        if (vc < 1.0e8f) {
+            float pk[3];
+            get_wp_(wps, i, pk);
+            float s_back = sqrtf((closest[0] - pk[0]) * (closest[0] - pk[0]) + (closest[1] - pk[1]) * (closest[1] - pk[1]));
+            v_lim = fminf(v_lim, sqrtf(vc * vc + 2.0f * a_brake * fmaxf(s_back - d, 0.0f)));
+        }
+    }
+    float pn[3];
+    get_wp_(wps, i + 1, pn);
+    float s = sqrtf((pn[0] - closest[0]) * (pn[0] - closest[0]) + (pn[1] - closest[1]) * (pn[1] - closest[1]));
+    float rel[3];
+    sub3_(pn, closest, rel);
+    float s3 = norm3_(rel);
+    float a_min = fminf(a_brake, (end_brake_accel > 0.0f) ? end_brake_accel : a_brake);
+    float s_reach = fmaxf(speed_cap, 0.0f) * fmaxf(speed_cap, 0.0f) / (2.0f * fmaxf(a_min, 0.1f)) + 50.0f;
+    bool reached_end = false;
+    for (int k = i + 1; k < n_wp; ++k) {
+        if (k == n_wp - 1) {
+            reached_end = true;
+            break;
+        }
+        if (corner_on) {
+            corner_geom_(wps, n_wp, k, a_lat, e_max, v_min, min_angle, &vc, &d);
+            if (vc < 1.0e8f) v_lim = fminf(v_lim, sqrtf(vc * vc + 2.0f * a_brake * fmaxf(s - d, 0.0f)));
+        }
+        float pa[3], pb[3];
+        get_wp_(wps, k, pa);
+        get_wp_(wps, k + 1, pb);
+        s += sqrtf((pb[0] - pa[0]) * (pb[0] - pa[0]) + (pb[1] - pa[1]) * (pb[1] - pa[1]));
+        sub3_(pb, pa, rel);
+        s3 += norm3_(rel);
+        if (s > s_reach) break;
+    }
+    if (end_brake_accel > 0.0f && reached_end) v_lim = fminf(v_lim, sqrtf(2.0f * end_brake_accel * s3));
+    return v_lim;
+}
+
 __device__ void guidance_modules_(
     int guid_type,
     int wp_idx_passed,
@@ -317,6 +403,11 @@ __device__ void guidance_modules_(
     float min_guid_eta,
     float gl_vertical_speed_gain,
     const float mppi_ctrl_input[2],
+    float max_heading_err,
+    float speed_kp,
+    float speed_guard_kp,
+    float speed_guard_margin,
+    float desired_speed,
     float acc_cmd[3]
 )
 {
@@ -328,6 +419,15 @@ __device__ void guidance_modules_(
     }
     if (wp_idx_heading >= (n_wp - 1)) {
         guid_type = 0;
+    }
+    // target more than max_heading_err off the velocity: pursuit law (as PF, see
+    // GuidanceTuningConfig.mppi_max_heading_error_deg); 0 = off
+    if (guid_type != 0 && max_heading_err > 0.0f && norm_xy_(vel) > 1e-3f) {
+        float az_v = atan2f(vel[1], vel[0]);
+        float az_t = atan2f(vt[1] - pos[1], vt[0] - pos[0]);
+        if (fabsf(wrap_pi_(az_t - az_v)) > max_heading_err) {
+            guid_type = 0;
+        }
     }
 
     if (guid_type == 0) {
@@ -362,6 +462,10 @@ __device__ void guidance_modules_(
 
     float acc_cmd_wind[3] = {0.0, 0.0, 0.0};
     acc_cmd_wind[0] = mppi_ctrl_input[0];
+    if (speed_kp > 0.0f) acc_cmd_wind[0] += speed_kp * (desired_speed - speed_mag);   // as PF
+    if (speed_guard_kp > 0.0f) {   // speed cap, as PF (mppi_speed_guard_kp)
+        acc_cmd_wind[0] = fminf(acc_cmd_wind[0], speed_guard_kp * (desired_speed + speed_guard_margin - speed_mag));
+    }
 
     float vec_to_target_ned[3] = {vt[0] - pos[0], vt[1] - pos[1], vt[2] - pos[2]};
     float vec_to_target_wind[3];
@@ -649,6 +753,7 @@ __device__ void cost_function_2_(
     float gamma,
     const float att_ang[3],
     float weight_by_var,
+    float speed_norm_floor,
     float cost_arr[3]
 )
 {
@@ -662,7 +767,7 @@ __device__ void cost_function_2_(
     float x0 = fminf(dist_to_path / fmaxf(path_error_scale, EPS_DIV), 1.0);
     float x0_q0_x0 = x0 * q[0] * x0;
 
-    float x1 = fminf(fabsf(mag_v - ref_v) / fmaxf(ref_v, EPS_DIV), 1.0);
+    float x1 = fminf(fabsf(mag_v - ref_v) / fmaxf(ref_v, speed_norm_floor), 1.0);
     float x1_q1_x1 = x1 * q[1] * x1;
 
     float x2 = sqrtf(att_ang[0] * att_ang[0] + att_ang[1] * att_ang[1]);
@@ -678,12 +783,13 @@ __device__ float terminal_cost_2_(
     const float vel_tf[3],
     float dist_to_path,
     float ref_v,
-    float path_error_scale
+    float path_error_scale,
+    float speed_norm_floor
 )
 {
     float mag_v = sqrtf(vel_tf[0] * vel_tf[0] + vel_tf[1] * vel_tf[1]);
     float x0 = fminf(dist_to_path / fmaxf(path_error_scale, EPS_DIV), 1.0);
-    float x1 = fminf(fabsf(mag_v - ref_v) / fmaxf(ref_v, EPS_DIV), 1.0);
+    float x1 = fminf(fabsf(mag_v - ref_v) / fmaxf(ref_v, speed_norm_floor), 1.0);
 
     return p[1] * x0 * x0 + p[2] * x1 * x1;
 }
@@ -789,6 +895,26 @@ extern "C" __global__ void mppi_rollout_kernel(
     float disturbance_var_weight_gain = arr_const[42];
     float disturbance_var_clip = arr_const[43];
     float cost_path_error_scale_m = fmaxf(arr_const[44], EPS_DEN);
+    float u0_bound = arr_const[47];   // 0 = unbounded (see MPPIRolloutTuningConfig)
+    float u1_max = arr_const[48];
+    // speed error is |v - ref| / max(ref, floor): with the original EPS a zero reference (stop)
+    // saturated the cost at any speed and left MPPI nothing to minimise
+    float speed_norm_floor = fmaxf(arr_const[49], EPS_DIV);
+    float max_heading_err = arr_const[50];
+    float speed_kp = arr_const[51];
+    float speed_guard_kp = arr_const[52];
+    float speed_guard_margin = arr_const[53];
+    // corner speed limit / rollout = PF guidance (core_mppi._make_const_vector 54-63)
+    int corner_on = (arr_const[54] > 0.5f) ? 1 : 0;
+    float corner_lat_accel = arr_const[55];
+    float corner_max_error = arr_const[56];
+    float corner_brake_accel = arr_const[57];
+    float corner_min_speed = arr_const[58];
+    float corner_min_angle = arr_const[59];
+    int rollout_sync = (arr_const[60] > 0.5f) ? 1 : 0;
+    float lookahead_time_s = arr_const[61];
+    float lookahead_max_m = arr_const[62];
+    float end_brake_accel = rollout_sync ? arr_const[63] : 0.0f;
 
     int wp_idx_heading = (int)arr_update[0];
     int wp_idx_passed = (int)arr_update[1];
@@ -800,7 +926,7 @@ extern "C" __global__ void mppi_rollout_kernel(
     float t_cmd = arr_update[12];
 
     float desired_speed = arr_update[13];
-    if (desired_speed <= 0.0) desired_speed = desired_speed_const;
+    if (desired_speed < 0.0) desired_speed = desired_speed_const;   // 0 is a valid (stop) reference
     float virtual_target_distance = arr_update[14];
     if (virtual_target_distance <= 0.0) virtual_target_distance = lookahead_distance_const;
 
@@ -809,6 +935,7 @@ extern "C" __global__ void mppi_rollout_kernel(
     wp_idx_passed = i_clamp_(wp_idx_passed, 0, n_wp - 1);
 
     float total_cost = 0.0;
+    float ref_speed_step = desired_speed;   // per-step speed reference (corner / end braking)
 
     float acc[3] = {0.0, 0.0, 0.0};
     float cI_B[3][3];
@@ -856,11 +983,26 @@ extern "C" __global__ void mppi_rollout_kernel(
             delta_u[1] = arr_delta_u1[idx + K * i_n];
             mppi_ctrl_input[0] = arr_u0[i_n] + delta_u[0];
             mppi_ctrl_input[1] = arr_u1[i_n] + delta_u[1];
+            if (u0_bound > 0.0f) mppi_ctrl_input[0] = clamp_(mppi_ctrl_input[0], -u0_bound, u0_bound);
+            if (u1_max > 0.0f) mppi_ctrl_input[1] = clamp_(mppi_ctrl_input[1], min_guid_eta, u1_max);
         }
 
         distance_to_path_(arr_waypoints_ned, n_wp, wp_idx_heading, pos, closest_on_path, &wp_idx_passed, &dist_to_path);
         check_waypoint_(arr_waypoints_ned, n_wp, &wp_idx_heading, pos, waypoint_switch_distance);
-        vtp_decision_(arr_waypoints_ned, n_wp, dist_to_path, virtual_target_distance, closest_on_path, wp_idx_passed, vt);
+        // the PF grows the lookahead with speed (lookahead_time_s, capped at lookahead_max_m)
+        float lookahead_step = virtual_target_distance;
+        if (rollout_sync && lookahead_time_s > 0.0f) {
+            lookahead_step = fmaxf(lookahead_step, norm3_(vel) * lookahead_time_s);
+            if (lookahead_max_m > 0.0f) lookahead_step = fminf(lookahead_step, lookahead_max_m);
+        }
+        vtp_decision_(arr_waypoints_ned, n_wp, dist_to_path, lookahead_step, closest_on_path, wp_idx_passed, vt);
+        // speed reference of this step: corner limit / end-of-path braking as the PF applies them
+        if (corner_on || end_brake_accel > 0.0f) {
+            ref_speed_step = fminf(desired_speed, path_speed_limit_(
+                arr_waypoints_ned, n_wp, wp_idx_passed, closest_on_path, desired_speed,
+                corner_on, corner_lat_accel, corner_max_error, corner_brake_accel, corner_min_speed,
+                corner_min_angle, end_brake_accel));
+        }
 
         if (!init_set) {
             init_wp_idx_passed = wp_idx_passed;
@@ -885,6 +1027,11 @@ extern "C" __global__ void mppi_rollout_kernel(
             min_guid_eta,
             gl_vertical_speed_gain,
             mppi_ctrl_input,
+            max_heading_err,
+            speed_kp,
+            speed_guard_kp,
+            speed_guard_margin,
+            ref_speed_step,
             acc_cmd
         );
 
@@ -932,10 +1079,11 @@ extern "C" __global__ void mppi_rollout_kernel(
                 dt,
                 delta_u,
                 mag_v,
-                desired_speed,
+                ref_speed_step,
                 gamma,
                 att,
                 weight_by_var,
+                speed_norm_floor,
                 cost_arr
             );
         } else {
@@ -1031,8 +1179,9 @@ extern "C" __global__ void mppi_rollout_kernel(
             P,
             vel,
             dist_to_path,
-            desired_speed,
-            cost_path_error_scale_m
+            ref_speed_step,
+            cost_path_error_scale_m,
+            speed_norm_floor
         );
     } else {
         float total_time = dt * N;

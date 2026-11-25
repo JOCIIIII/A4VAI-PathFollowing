@@ -592,6 +592,10 @@ class MPPICore:
             numerics=numerics_cfg,
         )
 
+        # ground / surface vehicle (vehicle yaml "ground" section): the rollout kernel is compiled with
+        # the PX4 rover_differential plant instead of the multicopter (mppi_kernel.cu GROUND_VEHICLE)
+        self.ground_cfg = vehicle_cfg.get("ground") if isinstance(vehicle_cfg.get("ground"), dict) else None
+
         self.runtime_flags = RuntimeFlagsState(guid_type=self.guid_type)
         self.vehicle_state = VehicleState()
         self.disturbance = DisturbanceState()
@@ -924,6 +928,41 @@ class MPPICore:
             dtype=np.float32,
         )
 
+    def _ground_defines(self) -> str:
+        g = self.ground_cfg
+        if g is None:
+            return ""
+        deg = math.radians
+        values = {
+            # output stage (core_pathfollowing._convert_acc_cmd_to_ground_cmd)
+            "GND_SPEED_MAX": float(g["speed_max"]),
+            "GND_TAU_SPEED_CMD": float(g["tau_speed"]),
+            "GND_YAW_KP": float(g["yaw_kp"]),
+            "GND_YAW_RATE_MAX": float(g["yaw_rate_max"]),
+            "GND_LEAD_MAX": deg(float(g["bearing_lead_max_deg"])),
+            "GND_RATE_SPEED_FLOOR": float(g.get("rate_speed_floor", 0.5)),
+            "GND_ALIGN_ENTER": deg(float(g.get("align_enter_deg", 45.0))),
+            "GND_ALIGN_EXIT": deg(float(g.get("align_exit_deg", 15.0))),
+            "GND_ALIGN_SPEED_MAX": float(g.get("align_speed_max", 0.5)),
+            "GND_ALIGN_SPEED": float(g.get("align_speed", 0.0)),
+            # PX4 rover_differential response (fitted: scripts/dev/ground/fit_ground_model.py)
+            "GND_TAU_SPEED": float(g.get("model_tau_speed", g["tau_speed"])),
+            "GND_TAU_YAW_RATE": float(g["tau_yaw_rate"]),
+            "GND_ACCEL_MAX": float(g["accel_max"]),
+            "GND_DECEL_MAX": float(g["decel_max"]),
+            "GND_YAW_ACCEL_MAX": float(g["yaw_accel_max"]),
+            "GND_PX4_YAW_RATE_LIM": deg(float(g["px4_yaw_rate_lim_deg"])),
+            "GND_SPOT_ENTER": deg(float(g["spot_turn_enter_deg"])),
+            "GND_SPOT_EXIT": deg(float(g["spot_turn_exit_deg"])),
+            "GND_MAX_THR_SPEED": float(g["max_thr_speed"]),
+            "GND_MAX_THR_YAW_R": float(g["max_thr_yaw_r"]),
+            "GND_TRACK_HALF": 0.5 * float(g["track"]),
+            "GND_COURSE_MIN_SPEED": float(g.get("course_min_speed", 0.3)),
+        }
+        if float(g.get("sway_tau", 0.0)) > 0.0:   # surface vessel: lateral velocity state (mppi_kernel.cu)
+            values["GND_SWAY_TAU"] = float(g["sway_tau"])
+        return "#define GROUND_VEHICLE 1\n" + "".join(f"#define {k} {v:.9e}f\n" for k, v in values.items())
+
     def _build_cuda_solver(self) -> None:
         if self.waypoints_ned is None:
             raise RuntimeError("[FATAL] waypoints must exist before building CUDA solver.")
@@ -937,6 +976,7 @@ class MPPICore:
         full_code = (
             f"#define N_WP {self._compiled_n_wp}\n"
             f"#define EPS_USER {float(self.cfg.numerics.eps):.16e}f\n"
+            + self._ground_defines()
             + kernel_body
         )
         self.module = SourceModule(full_code)

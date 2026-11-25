@@ -537,6 +537,72 @@ class NumericsConfig:
 
 
 @dataclass
+class GroundVehicleConfig:
+    # Ground (UGV) / surface (USV) vehicle under PX4 rover_differential offboard velocity control:
+    # the PX4 setpoint is a speed and a bearing (= yaw setpoint), PX4 closes speed -> throttle and
+    # bearing -> yaw (P, yaw_kp) -> yaw rate -> differential drive. The guidance law is unchanged
+    # (acceleration command in NED); only the output stage differs from the multicopter's
+    # acceleration -> thrust + attitude:
+    #   along-track accel  a_t -> speed command   v + a_t * tau_speed      (inverse of the speed lag)
+    #   lateral accel      a_n -> yaw rate        a_n / max(v, rate_speed_floor), |r| <= yaw_rate_max
+    #                          -> bearing command  yaw + r / yaw_kp          (inverse of PX4's yaw P)
+    # velocity_frame       the velocity the MPPI-guided steps (and the MPPI rollout's initial state) use.
+    #                      'heading': the forward speed along the yaw, no lateral velocity - a wheeled rover
+    #                      cannot move sideways, and what the estimator reports there (0.1-0.3 m/s of
+    #                      noise) was fed back as a turn command (pf_ugv_line_g0: +-20 deg of yaw wobble).
+    #                      'course': the estimated velocity as it is - a boat slips ~20 deg sideways in
+    #                      turns; the rollout models it (sway_tau, mppi_kernel.cu GND_SWAY_TAU).
+    #                      The pursuit law (guid 0) always uses 'heading': its velocity-error feedback on the
+    #                      boat's sway made it oscillate (offline loop: circle p95 3.0 vs 1.1 m)
+    # speed_max            [m/s] PX4 RO_SPEED_LIM
+    # tau_speed            [s]   measured lag of PX4's speed loop (step test)
+    # yaw_kp               [1/s] PX4 RO_YAW_P
+    # yaw_rate_max         [rad/s] <= PX4 RO_YAW_RATE_LIM
+    # bearing_lead_max_deg how far the bearing may lead the yaw while driving: below PX4's
+    #                      drive -> spot-turn switch (RD_TRANS_DRV_TRN), or the rover stops to turn
+    # course_min_speed     [m/s] direction of travel = velocity azimuth above it, the yaw below
+    # rate_speed_floor     [m/s] speed floor of a_n / v
+    # align_enter_deg / align_exit_deg / align_speed_max: below align_speed_max and more than
+    #                      align_enter_deg off the direction to the virtual target, the bearing is
+    #                      that direction itself (PX4 turns on the spot or in its smallest circle)
+    #                      until within align_exit_deg - a start that is not aligned with the path
+    speed_max: float
+    tau_speed: float
+    yaw_kp: float
+    yaw_rate_max: float
+    bearing_lead_max_deg: float
+    course_min_speed: float
+    rate_speed_floor: float
+    align_enter_deg: float
+    align_exit_deg: float
+    align_speed_max: float
+    align_speed: float
+    velocity_frame: str
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> "GroundVehicleConfig":
+        out = cls(
+            velocity_frame=str(cfg.get("velocity_frame", "heading")),
+            speed_max=float(cfg["speed_max"]),
+            tau_speed=float(cfg["tau_speed"]),
+            yaw_kp=float(cfg["yaw_kp"]),
+            yaw_rate_max=float(cfg["yaw_rate_max"]),
+            bearing_lead_max_deg=float(cfg["bearing_lead_max_deg"]),
+            course_min_speed=float(cfg.get("course_min_speed", 0.3)),
+            rate_speed_floor=float(cfg.get("rate_speed_floor", 0.5)),
+            align_enter_deg=float(cfg.get("align_enter_deg", 45.0)),
+            align_exit_deg=float(cfg.get("align_exit_deg", 15.0)),
+            align_speed_max=float(cfg.get("align_speed_max", 0.5)),
+            align_speed=float(cfg.get("align_speed", 0.0)),
+        )
+        if (out.speed_max <= 0.0 or out.tau_speed <= 0.0 or out.yaw_kp <= 0.0 or out.yaw_rate_max <= 0.0
+                or out.bearing_lead_max_deg <= 0.0 or out.rate_speed_floor <= 0.0
+                or out.velocity_frame not in ("heading", "course")):
+            raise RuntimeError("[FATAL] invalid ground vehicle config.")
+        return out
+
+
+@dataclass
 class CoreConfig:
     model: VehicleModelConfig
     actuator: ActuatorConfig
@@ -612,6 +678,16 @@ class AttitudeCommand:
     thrust_norm_cmd: float = 0.0
 
 
+@dataclass
+class GroundCommand:
+    speed: float = 0.0          # [m/s] speed setpoint
+    bearing: float = 0.0        # [rad, NED] bearing = yaw setpoint
+    yaw_rate: float = 0.0       # [rad/s] the turn rate the bearing lead asks for
+    acc_t: float = 0.0          # [m/s^2] guidance acceleration along the direction of travel
+    acc_n: float = 0.0          # [m/s^2] ... and to its right
+    align: int = 0              # 1 while turning toward the path before driving
+
+
 # =====================================================
 # core
 # =====================================================
@@ -648,6 +724,15 @@ class PathFollowingCore:
             ndo=NDOConfig.from_dict(sim_cfg["ndo"]),
             numerics=NumericsConfig.from_dict(sim_cfg),
         )
+
+        # ground / surface vehicle: the vehicle yaml has a "ground" section (ugv.yaml, usv.yaml)
+        self.ground = (GroundVehicleConfig.from_dict(vehicle_cfg["ground"])
+                       if isinstance(vehicle_cfg.get("ground"), dict) else None)
+        self.ground_cmd = GroundCommand()
+        self._ground_align = False
+        self._ground_end = False
+        self._yaw_prev = None
+        self._yaw_rate = 0.0
 
         self.state = VehicleState()
         self.path = PathState()
@@ -713,11 +798,25 @@ class PathFollowingCore:
         vy: float,
         vz: float,
     ) -> None:
+        if self.ground is not None:
+            # planar: distances and waypoint switching are 3-D, and a ground EKF's z drifts
+            z, vz = 0.0, 0.0
         self.state.position_ned[:] = [x, y, z]
         self.state.velocity_ned[:] = [vx, vy, vz]
 
-    def update_attitude_quat(self, q0: float, q1: float, q2: float, q3: float) -> None:
+    def update_attitude_quat(self, q0: float, q1: float, q2: float, q3: float, timestamp_us: int | None = None) -> None:
         roll, pitch, yaw = euler_from_quat(q0, q1, q2, q3)
+        if self.ground is not None:
+            roll, pitch = 0.0, 0.0
+            # yaw rate for the MPPI rollout's initial state (low-passed difference of the attitude)
+            if timestamp_us is not None:
+                t = float(timestamp_us) * 1.0e-6
+                if self._yaw_prev is not None and t > self._yaw_prev[0]:
+                    dt = t - self._yaw_prev[0]
+                    r = ((yaw - self._yaw_prev[1] + math.pi) % (2.0 * math.pi) - math.pi) / dt
+                    a = dt / (0.05 + dt)
+                    self._yaw_rate += a * (r - self._yaw_rate)
+                self._yaw_prev = (t, yaw)
         self.state.euler_rpy[:] = [roll, pitch, yaw]
 
     def update_accel_xyz(self, ax: float, ay: float, az: float) -> None:
@@ -734,6 +833,8 @@ class PathFollowingCore:
         should_reset_tracking = False
 
         if self.wp_type == 0:
+            if self.ground is not None:
+                waypoint_z = [0.0] * len(waypoint_x)
             waypoints_ned = build_waypoints(
                 0,
                 waypoint_x=waypoint_x,
@@ -758,6 +859,7 @@ class PathFollowingCore:
             self.path.waypoints_ned = waypoints_ned
             self.path.ready = True
 
+            self._ground_end = False
             if is_live_update:
                 self._relocalize_on_path(waypoints_ned)
             else:
@@ -830,7 +932,8 @@ class PathFollowingCore:
 
         waypoints_ned = self.path.waypoints_ned
         position_ned = self.state.position_ned
-        velocity_ned = self.state.velocity_ned
+        velocity_ned = self._guidance_velocity()
+        velocity_pursuit_ned = self._guidance_velocity(pursuit=True) if self.ground is not None else None
         dcm_ned_to_body = dcm_from_euler321(self.state.euler_rpy)
 
         dist_to_path, closest_point_ned, passed_wp_idx = self._distance_to_path(
@@ -931,12 +1034,39 @@ class PathFollowingCore:
             closest_point_ned=self.path.closest_point_ned,
             xt_gain=tuning.xt_gain,
             acc_ff_ned=acc_ff_ned,
+            velocity_pursuit_ned=velocity_pursuit_ned,
         )
         self.path.interrupt_prev = int(interrupt_prev)
         self._last_guid_type_used = int(guid_type_used)
 
         if int(reset_mppi) == 1:
             self.mppi.reset_flag = 1
+
+        if self.ground is not None:
+            # ground / surface vehicle: no gravity, no thrust, no disturbance observer.
+            # End of the path: the vehicle cannot hover back onto the last waypoint, so the path ends
+            # once it is within the tolerance of the end OR has crossed the end line; from then on it
+            # brakes on its heading and the path is done when it has (almost) stopped. Without this
+            # the rover overshot by 0.8 m, turned round on the spot to drive back and kept hunting.
+            end_ned = waypoints_ned[-1]
+            seg_ned = end_ned - waypoints_ned[-2]
+            if (self.path.heading_index >= waypoints_ned.shape[0] - 1
+                    and (float(np.dot(position_ned - end_ned, seg_ned)) >= 0.0
+                         or float(np.linalg.norm(end_ned - position_ned)) < tuning.final_wp_tolerance_m)):
+                self._ground_end = True
+            if self._ground_end:
+                self.path.pf_done = bool(done_speed_max <= 0.0
+                                         or float(np.linalg.norm(velocity_ned)) <= done_speed_max)
+            self.ground_cmd = self._convert_acc_cmd_to_ground_cmd(
+                acc_cmd_ned, virtual_target, velocity_pursuit_ned if int(guid_type_used) == 0 else velocity_ned)
+            self._log_step()
+            return {
+                "att_cmd": self.att_cmd,
+                "ground_cmd": self.ground_cmd,
+                "heading_wp_idx": int(self.path.heading_index),
+                "pf_done": bool(self.path.pf_done),
+                "guid_type_used": int(guid_type_used),
+            }
 
         acc_cmd_compensated = acc_cmd_ned.copy()
         acc_cmd_compensated = acc_cmd_compensated - self.ndo.disturbance_acc_ned
@@ -1002,13 +1132,14 @@ class PathFollowingCore:
             float(self.state.position_ned[0]),
             float(self.state.position_ned[1]),
             float(self.state.position_ned[2]),
-            float(self.state.velocity_ned[0]),
-            float(self.state.velocity_ned[1]),
-            float(self.state.velocity_ned[2]),
+            float(self._guidance_velocity()[0]),
+            float(self._guidance_velocity()[1]),
+            float(self._guidance_velocity()[2]),
             float(self.state.euler_rpy[0]),
             float(self.state.euler_rpy[1]),
             float(self.state.euler_rpy[2]),
-            float(self.att_cmd.total_thrust_cmd),
+            # ground / surface vehicle: the yaw rate in the thrust slot (mppi_kernel.cu GROUND_VEHICLE)
+            float(self._yaw_rate if self.ground is not None else self.att_cmd.total_thrust_cmd),
         ]
 
     def get_mppi_waypoints_ned(self) -> list[float] | None:
@@ -1221,10 +1352,16 @@ class PathFollowingCore:
         passed_wp_idx = int(np.clip(passed_wp_idx, 0, num_waypoints - 2))
 
         virtual_target_ned = path_waypoints[min(passed_wp_idx + 1, num_waypoints - 1)].copy()
-        if dist_to_path >= lookahead_distance:
+        # ground / surface vehicle: the target is always lookahead_distance AHEAD of the closest point
+        # along the path ("carrot"). The multicopter rule (target lookahead - distance ahead, the
+        # closest point itself once off the path) sent a rover that had overshot a corner straight at
+        # the path, perpendicular to it: it crossed, turned on the spot, crossed back (pf_ugv_sqsharp_g0,
+        # 1.2 m off the path). The kernel's vtp_decision_ does the same (GROUND_VEHICLE).
+        ground = self.ground is not None
+        if dist_to_path >= lookahead_distance and not ground:
             virtual_target_ned = closest_point_ned.copy()
         else:
-            total_len = dist_to_path
+            total_len = 0.0 if ground else dist_to_path
             segment_start = closest_point_ned.copy()
 
             for wp_idx in range(passed_wp_idx + 1, path_waypoints.shape[0]):
@@ -1272,6 +1409,7 @@ class PathFollowingCore:
         closest_point_ned: np.ndarray | None = None,
         xt_gain: float = 0.0,
         acc_ff_ned: np.ndarray | None = None,
+        velocity_pursuit_ned: np.ndarray | None = None,
     ) -> tuple[np.ndarray, int, int, int]:
         reset_mppi = 0
         transition_mode = 0
@@ -1308,6 +1446,8 @@ class PathFollowingCore:
         acc_cmd_ned = np.zeros(3, dtype=float)
 
         if guid_type == 0:
+            if velocity_pursuit_ned is not None:
+                velocity_ned = velocity_pursuit_ned
             pos_error_ned = virtual_target_ned - position_ned
             kp_pos = position_kp
             vel_cmd_ned = kp_pos * pos_error_ned
@@ -1556,6 +1696,74 @@ class PathFollowingCore:
         att_cmd_rpy = np.array([roll_cmd, pitch_cmd, yaw_des], dtype=float)
         return float(thrust_cmd_total), float(thrust_cmd_norm), att_cmd_rpy
 
+    def _guidance_velocity(self, pursuit: bool = False) -> np.ndarray:
+        # the velocity the guidance (and the MPPI rollout's initial state) works with; for a ground /
+        # surface vehicle the pursuit law always takes the heading-frame one (see GroundVehicleConfig)
+        if self.ground is None or (self.ground.velocity_frame != "heading" and not pursuit):
+            return self.state.velocity_ned
+        yaw = float(self.state.euler_rpy[2])
+        v = self.state.velocity_ned
+        # floor 1 mm/s: the guidance takes the direction of travel from this vector (MPPI's frame),
+        # a zero vector would point it north
+        forward = max(float(v[0]) * math.cos(yaw) + float(v[1]) * math.sin(yaw), 1.0e-3)
+        return np.array([forward * math.cos(yaw), forward * math.sin(yaw), 0.0], dtype=float)
+
+    def _convert_acc_cmd_to_ground_cmd(
+        self,
+        acc_cmd_ned: np.ndarray,
+        virtual_target_ned: np.ndarray,
+        velocity_ned: np.ndarray,
+    ) -> GroundCommand:
+        g = self.ground
+        position_ned = self.state.position_ned
+        yaw = float(self.state.euler_rpy[2])
+        speed = math.hypot(float(velocity_ned[0]), float(velocity_ned[1]))
+        forward_speed = float(velocity_ned[0]) * math.cos(yaw) + float(velocity_ned[1]) * math.sin(yaw)
+
+        # direction of travel: the velocity azimuth once moving, the yaw at rest
+        course = math.atan2(float(velocity_ned[1]), float(velocity_ned[0])) if speed > g.course_min_speed else yaw
+        t_hat = (math.cos(course), math.sin(course))
+        acc_t = float(acc_cmd_ned[0]) * t_hat[0] + float(acc_cmd_ned[1]) * t_hat[1]
+        acc_n = -float(acc_cmd_ned[0]) * t_hat[1] + float(acc_cmd_ned[1]) * t_hat[0]
+
+        yaw_rate = acc_n / max(speed, g.rate_speed_floor)
+        yaw_rate = max(min(yaw_rate, g.yaw_rate_max), -g.yaw_rate_max)
+        lead_max = math.radians(g.bearing_lead_max_deg)
+        lead = max(min(yaw_rate / g.yaw_kp, lead_max), -lead_max)
+        bearing = yaw + lead
+
+        speed_cmd = max(forward_speed, 0.0) + acc_t * g.tau_speed
+
+        # not aligned with the path at (almost) rest: turn toward the virtual target first
+        to_target = virtual_target_ned - position_ned
+        if math.hypot(float(to_target[0]), float(to_target[1])) > self.cfg.numerics.eps:
+            az_target = math.atan2(float(to_target[1]), float(to_target[0]))
+            err = abs((az_target - yaw + math.pi) % (2.0 * math.pi) - math.pi)
+            if self._ground_align:
+                if err < math.radians(g.align_exit_deg):
+                    self._ground_align = False
+            elif speed < g.align_speed_max and err > math.radians(g.align_enter_deg):
+                self._ground_align = True
+            if self._ground_align:
+                bearing = az_target
+                yaw_rate = 0.0
+                speed_cmd = g.align_speed
+        speed_cmd = max(min(speed_cmd, g.speed_max), 0.0)
+        if self._ground_end or self.path.pf_done:
+            self._ground_align = False
+            speed_cmd = 0.0
+            yaw_rate = 0.0
+            bearing = yaw
+
+        return GroundCommand(
+            speed=float(speed_cmd),
+            bearing=float((bearing + math.pi) % (2.0 * math.pi) - math.pi),
+            yaw_rate=float(yaw_rate),
+            acc_t=float(acc_t),
+            acc_n=float(acc_n),
+            align=int(self._ground_align),
+        )
+
     def _update_disturbance_acc(self, thrust_cmd_total: float) -> None:
         gains = self.cfg.ndo.gain
         velocity_ned = self.state.velocity_ned
@@ -1644,6 +1852,9 @@ class PathFollowingCore:
                 ndo=self.ndo.disturbance_acc_ned,
                 speed_ref=float(self.path.speed_ref),
                 lookahead=float(self.path.lookahead),
+                ground=(None if self.ground is None else [
+                    self.ground_cmd.speed, self.ground_cmd.bearing, self.ground_cmd.yaw_rate,
+                    self.ground_cmd.acc_t, self.ground_cmd.acc_n, self.ground_cmd.align]),
             )
         except Exception:
             pass

@@ -30,6 +30,11 @@ from .core.core_pathfollowing import PathFollowingCore
 from .utils.logger import logger
 
 
+# vehicle_type -> vehicle yaml. 3 / 4: ground (UGV) and surface (USV) vehicles under PX4
+# rover_differential - their yaml has a "ground" section, which switches the core's output stage
+# from thrust + attitude to speed + bearing (core_pathfollowing.GroundVehicleConfig)
+VEHICLE_YAML = {1: 'quad.yaml', 2: 'octo.yaml', 3: 'ugv.yaml', 4: 'usv.yaml'}
+
 # per-launch overrides of the corner speed limit (defaults as GuidanceTuningConfig)
 CORNER_FLOAT_PARAMS = (
     ('corner_lat_accel_mps2', 4.0),
@@ -62,7 +67,7 @@ class NodePathFollowing(Node):
 
         vehicle_type = self._require_int(
             'vehicle_type',
-            allowed={1, 2},
+            allowed=set(VEHICLE_YAML),
             default=sim_cfg.get('vehicle_type'),
         )
         guid_type = self._require_int(
@@ -76,7 +81,7 @@ class NodePathFollowing(Node):
             default=sim_cfg.get('wp_type'),
         )
 
-        vehicle_yaml = 'quad.yaml' if vehicle_type == 1 else 'octo.yaml'
+        vehicle_yaml = VEHICLE_YAML[vehicle_type]
         vehicle_cfg = self._load_yaml(vehicle_yaml)
         # the sim yaml may override vehicle-model entries per vehicle file (sim_ca_mppi.yaml: the
         # MPPI rollout's attitude time constants): {quad|octo: {section: {key: value}}}
@@ -242,6 +247,14 @@ class NodePathFollowing(Node):
         self.attitude_setpoint_publisher = self.create_publisher(
             VehicleAttitudeSetpoint,
             '/pf_att_2_control',
+            10,
+        )
+
+        # ground / surface vehicle: [speed m/s, bearing rad (NED), yaw rate rad/s, acc_t, acc_n, align,
+        # guid_type_used] - the driver turns speed + bearing into PX4's offboard velocity setpoint
+        self.ground_cmd_publisher = self.create_publisher(
+            Float32MultiArray,
+            '/pf_ground_cmd',
             10,
         )
 
@@ -456,6 +469,7 @@ class NodePathFollowing(Node):
             msg.q[1],
             msg.q[2],
             msg.q[3],
+            timestamp_us=int(msg.timestamp),
         )
 
     def _vehicle_acceleration_callback(self, msg: VehicleAcceleration) -> None:
@@ -501,6 +515,18 @@ class NodePathFollowing(Node):
         if output is None:
             return
 
+        ground_command = output.get("ground_cmd")
+        if ground_command is not None:
+            ground_msg = Float32MultiArray()
+            ground_msg.data = [
+                float(ground_command.speed), float(ground_command.bearing), float(ground_command.yaw_rate),
+                float(ground_command.acc_t), float(ground_command.acc_n), float(ground_command.align),
+                float(output["guid_type_used"]),
+            ]
+            self.ground_cmd_publisher.publish(ground_msg)
+            self._publish_progress(output)
+            return
+
         attitude_command = output["att_cmd"]
 
         attitude_setpoint_msg = VehicleAttitudeSetpoint()
@@ -512,7 +538,9 @@ class NodePathFollowing(Node):
         attitude_setpoint_msg.thrust_body[1] = 0.0
         attitude_setpoint_msg.thrust_body[2] = float(attitude_command.thrust_body[2])
         self.attitude_setpoint_publisher.publish(attitude_setpoint_msg)
+        self._publish_progress(output)
 
+    def _publish_progress(self, output) -> None:
         heading_waypoint_index_msg = Int32()
         heading_waypoint_index_msg.data = int(output["heading_wp_idx"])
         self.heading_waypoint_index_publisher.publish(heading_waypoint_index_msg)

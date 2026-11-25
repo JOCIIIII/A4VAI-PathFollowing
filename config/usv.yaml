@@ -1,0 +1,77 @@
+############################################################
+#
+#   - Name : usv.yaml
+#
+#   USV: twin-thruster boat (PX4 boat model, 227 kg, SITL airframe 2011).
+#   PX4 v1.16 rover_differential, offboard velocity setpoint (speed + bearing).
+#   "ground" switches the PathFollowing output stage and the MPPI rollout plant from the
+#   multicopter (thrust + attitude) to speed + bearing (core_pathfollowing.GroundVehicleConfig,
+#   mppi_kernel.cu GROUND_VEHICLE). model / actuator / px4_model are placeholders the config
+#   loaders require; a ground vehicle does not use them.
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    model:
+      mass: 227.0
+      Ixx: 100.0
+      Iyy: 300.0
+      Izz: 300.0
+      gravity: 9.81
+
+    actuator:
+      n_motor: 2
+      max_thrust_per_rotor: 100.0
+      rotor_positions:
+        - [0.0,  0.5, 0.0]
+        - [0.0, -0.5, 0.0]
+      spin_direction: [1, 1]
+
+    px4_model:
+      max_tilt_deg: 35.0
+      max_accel_xy: 4.0
+      max_accel_z: 2.5
+      tau_phi: 0.3
+      tau_the: 0.3
+      tau_psi: 0.6
+      del_psi_cmd_limit_deg: 20.0
+      tau_wb: 0.05
+      tau_p: 0.1
+      tau_q: 0.1
+      tau_r: 0.2
+      alpha_p: 0.1
+      alpha_q: 0.1
+      alpha_r: 0.1
+      tau_throttle: 0.01875
+
+    ground:
+      # PX4 side (airframe 2011): RO_SPEED_LIM 4, RO_ACCEL_LIM 1, RO_DECEL_LIM 1, RO_YAW_P 1.5,
+      # RO_YAW_RATE_LIM 40 deg/s, RO_YAW_ACCEL_LIM 40 deg/s^2, drive -> spot turn at 100 deg
+      # measured (scripts/dev/ground step test step_usv_4): speed step 63 % in 1.6-2.6 s, 20 deg
+      # bearing step 63 % in 0.9 s (peak 30 deg/s), 90 deg in 1.9 s (peak 50 deg/s), stop in 2.7 s
+      velocity_frame: course   # the guidance sees the real direction of travel: the hull slips ~20 deg in turns (sway_tau below)
+      speed_max: 4.0
+      accel_max: 1.0
+      decel_max: 1.0
+      tau_speed: 2.0   # = fitted speed response (step_usv_4)
+      yaw_kp: 1.5
+      yaw_rate_max: 0.6
+      yaw_accel_max: 0.7
+      tau_yaw_rate: 0.4
+      bearing_lead_max_deg: 23.0     # 0.6 rad/s / 1.5 1/s
+      spot_turn_enter_deg: 100.0
+      spot_turn_exit_deg: 57.0
+      course_min_speed: 0.4
+      rate_speed_floor: 1.0
+      align_enter_deg: 60.0
+      align_exit_deg: 20.0
+      align_speed_max: 0.6
+      align_speed: 0.0               # differential thrust turns the boat in place
+      # PX4 parameters the rollout plant needs (airframe 2011) and its fitted response
+      px4_yaw_rate_lim_deg: 40.0     # RO_YAW_RATE_LIM
+      max_thr_speed: 4.5             # RO_MAX_THR_SPEED
+      max_thr_yaw_r: 1.0             # RD_MAX_THR_YAW_R
+      track: 2.0                     # RD_WHEEL_TRACK = thruster separation
+      model_tau_speed: 2.0           # fitted speed response [s] (fit_ground_model.py, step_usv_4)
+      sway_tau: 2.5                  # lateral velocity time constant [s], fitted to the boat's logs (v_lat' = -v_lat/tau - u r)

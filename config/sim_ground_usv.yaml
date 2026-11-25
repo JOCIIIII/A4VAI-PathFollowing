@@ -1,0 +1,163 @@
+############################################################
+#
+#   - Name : sim_ground_usv.yaml
+#
+#   USV (twin-thruster boat, usv.yaml), 1-4 m/s.
+#   Same structure and the same MPPI guidance (guid_type 2) as sim_ca_mppi.yaml (its comments
+#   explain the entries); the values marked "ground" are rescaled from the multicopter's
+#   3-10 m/s to the vehicle's speed, turn rate and size (step test of scripts/dev/ground).
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    vehicle_type: 4   # 3: UGV (ugv.yaml), 4: USV (usv.yaml)
+    # 1: quad, 2: octa
+
+    guid_type: 2
+    # 0: Pos. Ctrl, 1: MPPI-GL (original cost), 2: MPPI-GL (cruise speed control)
+    
+    wp_type: 0
+    # 0: path planning solution, 1: straight line, 2: rectangle
+    # 3: zigzag, 4: circle, 5: figure-8
+    # 6: Alt change, 7: Spiral, 8: Lissajous curve (figure 8)
+
+    path_following:
+      dt_pf: 0.004
+      # cruise speed for MPPI (guid 1/2, e.g. run-pf-test.sh). The SUPER pipeline (guid 0
+      # speed mode) is driven by /desired_speed from super_pf_bridge instead.
+      desired_speed: 2.5   # ground
+      # pursuit lookahead floor (speed mode grows it as speed * lookahead_time_s). 4.5 m cut
+      # the inside of SUPER's tight avoidance curves by ~0.5 m at low speed.
+      lookahead_distance: 6.0   # ground
+      waypoint_switch_distance: 6.0   # ground
+
+      # guid type = 0
+      kp_vel: 1.0
+      kd_vel: 0.0
+
+      # legacy speed-guidance params (currently unused in core)
+      kp_speed: 3.0
+      kd_speed: 0.0
+      guid_eta: 2.0
+
+      # guidance transition / geometry tuning
+      final_wp_tolerance_m: 1.5   # ground
+      transition_speed_threshold_mps: 0.8   # ground
+      position_kp: 0.5
+      position_kv_multiplier: 1.6   # ground: kp_vel = 0.5 x 1.6 = 0.8 [1/s]; the boat heading loop is slow (pf_usv_line_g0 oscillated at 2.5)
+      min_guid_eta: 0.5   # ground: the pursuit law flies with 0.8
+      gl_vertical_speed_gain: 2.0
+
+      # guid type = 0, speed-regulated pursuit (inhousesim 10 m/s):
+      # |v_cmd| = desired_speed (or /desired_speed), capped by sqrt(2*brake*remaining
+      # path); direction = toward the lookahead target, which grows with speed.
+      pos_speed_mode: true
+      lookahead_time_s: 3.2   # ground
+      lookahead_max_m: 12.0   # ground
+      brake_accel_mps2: 0.3   # ground
+      # tracking at speed: the vehicle trailed on the OUTSIDE of SUPER's curves
+      # (velocity-loop lag, no feed-forward). Add the path's horizontal centripetal
+      # acceleration (gain*v^2*kappa, 0.3 s ahead, <= 4 m/s^2) and a 0.5 1/s cross-track
+      # pull that also works when the speed reference is ~0 (stopping on a replan).
+      # gain 1.0 over-corrected to the inside of turns (69%, +0.12 m) - i.e. toward the
+      # obstacle on avoidance bends -> 0.7.
+      curvature_ff_gain: 0.7
+      curvature_ff_lead_s: 0.3
+      curvature_ff_max_accel: 1.5   # ground
+      xt_gain: 0.5
+      # cap on the disturbance-observer estimate [m/s^2] (ground contact / saturation)
+      ndo_max_accel: 0.0   # ground
+      # only hand over to landing once (almost) stopped at the goal
+      done_speed_max: 0.4   # ground
+      # after overshooting the path end, return to it at <= 1 m/s (kp * distance)
+      terminal_speed_max: 0.8   # ground
+      mppi_speed_transition: true   # sim_ca_mppi
+      yaw_mode: velocity            # sim_ca_mppi: nose along the direction of travel
+      yaw_rate_limit_deg: 90.0      # sim_ca_mppi
+      vertical_priority: false   # ground
+      mppi_output_tau_s: 0.15       # sim_ca_mppi
+      mppi_max_heading_error_deg: 90.0   # sim_ca_mppi: pursuit for sharp turns / reversals
+      mppi_speed_kp: 1.0            # sim_ca_mppi: speed feedback on top of MPPI's u0 [1/s]
+      mppi_speed_guard_kp: 2.0      # sim_ca_mppi: speed cap min(acc, kp*(ref+margin-v)) [1/s]
+      # ground: corner speed limit on, rollout = PF guidance (see GuidanceTuningConfig)
+      corner_speed_enable: true
+      mppi_rollout_sync: true
+      corner_lat_accel_mps2: 1.0
+      corner_max_error_m: 1.0
+      corner_brake_accel_mps2: 0.6
+      corner_min_speed_mps: 1.0
+      corner_min_angle_deg: 10.0
+      mppi_speed_guard_margin: 0.1  # sim_ca_mppi: [m/s]
+
+    # guid type = 1,2
+    mppi:
+      dt_mppi: 0.05
+      num_samples: 2048          # sim_ca_mppi (sim.yaml 512)
+      horizon_steps: 100   # ground: 5 s - the boat turns slowly; with 2 s (5 m at 2.5 m/s) the turn gain u1 barely changed the cost inside the horizon and sat at its lower bound (d_usv_pp_harbour_g2: median 0.39, 2.5 m off after corners)
+      cost_min_v_aligned: 0.3
+      use_gpr_forecast: true
+
+      # rollout tuning
+      type2_gamma_scale: 0.05
+      disturbance_var_weight_gain: 40.0
+      disturbance_var_clip: 5.0e-4
+      cost_path_error_scale_m: 3.0   # ground
+      gpr_var_bias: 1.0e-2
+      gpr_var_clip: 1.0
+      u0_bound: 1.0   # ground
+      u1_max: 3.0   # ground: with 1.5 the gain sat near the cap on the R15 circle and the boat ran ~2 m outside (it slips outward; the rollout model has no sideslip)
+      smooth_window: 9
+      output_rate_u0: 10.0
+      output_rate_u1: 10.0
+      speed_norm_floor: 1.5   # ground
+      noise_corr_tau_s: 0.5       # sim_ca_mppi: correlated exploration (see MPPIRolloutTuningConfig)
+      lambda_quantile: 0.05       # sim_ca_mppi: best 5% of the samples share the update
+
+      # guid type = 1
+      type_1:
+        state_cost: [0.01, 0.01, 0.01]      # Q
+        terminal_cost: [0.05, 0.05, 0.05]   # P
+        noise_std_u0_scale: 0.7
+        noise_std_u1_scale: 0.7
+        lambda_weight: 0.000245
+        u0_init: 0.5
+        u1_init: 2.0
+
+      # guid type = 2
+      type_2:
+        state_cost: [75.0, 100.0, 5.0]      # Q  (sim_ca_mppi: speed 100, sim.yaml 50)
+        terminal_cost: [0.0, 100.0, 5.0]    # P
+        noise_std_u0_scale: 0.5     # sim_ca_mppi (sim.yaml 0.0447)
+        noise_std_u1_scale: 0.3     # sim_ca_mppi (sim.yaml 0.0894)
+        lambda_weight: 0.1
+        u0_init: 0.0
+        u1_init: 1.0   # ground: the boat turns slowly (gain = yaw rate per rad of heading error)
+
+
+    ndo:
+      gain: [5.0, 5.0, 5.0]
+
+    numerics:
+      eps: 1.0e-9
+
+    gpr:
+      dt_gpr: 0.01
+      dt_gpr_opt_mul: 20
+      forecast_steps: 2000
+
+      measurement_matrix: [1.0, 0.0]
+
+      meas_noise_var_x: 1.0e-6
+      meas_noise_var_y: 1.0e-6
+
+      hyp_l_init: [1.0, 1.0]
+      hyp_q_init: [1.0, 1.0]
+      hyp_n: 500
+
+      hyp_l_min: 1.0e-2
+      hyp_l_max: 0.5
+      hyp_q_min: 1.0e-2
+      hyp_q_max: 0.5
+
+      lpf_cutoff_hz: 5

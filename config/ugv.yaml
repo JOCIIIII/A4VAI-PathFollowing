@@ -1,0 +1,76 @@
+############################################################
+#
+#   - Name : ugv.yaml
+#
+#   UGV: differential-drive rover (PX4 r1_rover model, SITL airframe 2010).
+#   PX4 v1.16 rover_differential, offboard velocity setpoint (speed + bearing).
+#   "ground" switches the PathFollowing output stage and the MPPI rollout plant from the
+#   multicopter (thrust + attitude) to speed + bearing (core_pathfollowing.GroundVehicleConfig,
+#   mppi_kernel.cu GROUND_VEHICLE). model / actuator / px4_model are placeholders the config
+#   loaders require; a ground vehicle does not use them.
+#
+############################################################
+
+node_pathfollowing:
+  ros__parameters:
+    model:
+      mass: 20.0
+      Ixx: 1.0
+      Iyy: 1.0
+      Izz: 1.0
+      gravity: 9.81
+
+    actuator:
+      n_motor: 2
+      max_thrust_per_rotor: 100.0
+      rotor_positions:
+        - [0.0,  0.5, 0.0]
+        - [0.0, -0.5, 0.0]
+      spin_direction: [1, 1]
+
+    px4_model:
+      max_tilt_deg: 35.0
+      max_accel_xy: 4.0
+      max_accel_z: 2.5
+      tau_phi: 0.3
+      tau_the: 0.3
+      tau_psi: 0.6
+      del_psi_cmd_limit_deg: 20.0
+      tau_wb: 0.05
+      tau_p: 0.1
+      tau_q: 0.1
+      tau_r: 0.2
+      alpha_p: 0.1
+      alpha_q: 0.1
+      alpha_r: 0.1
+      tau_throttle: 0.01875
+
+    ground:
+      # PX4 side (airframe 2010): RO_SPEED_LIM 2.5, RO_ACCEL_LIM 3, RO_DECEL_LIM 5, RO_YAW_P 5,
+      # RO_YAW_RATE_LIM 120 deg/s, RO_YAW_ACCEL_LIM 120 deg/s^2, drive -> spot turn at 20 deg
+      # measured (scripts/dev/ground step test step_ugv_7): speed step 63 % in 0.5 s, 15 deg
+      # bearing step 63 % in 0.5-0.6 s (peak 35-45 deg/s), spot turn up to 150-170 deg/s
+      velocity_frame: heading
+      speed_max: 2.5
+      accel_max: 3.0
+      decel_max: 5.0
+      tau_speed: 0.5
+      yaw_kp: 5.0
+      yaw_rate_max: 1.4
+      yaw_accel_max: 3.1             # fitted: 1.5 x RO_YAW_ACCEL_LIM (fit_ground_model.py --drive-only, h_move_cur)
+      tau_yaw_rate: 0.1              # fitted yaw-rate response [s] (driving regime: speed rms 0.07 m/s, yaw rms 1.5 deg)
+      bearing_lead_max_deg: 16.0     # 1.4 rad/s / 5 1/s; below the 20 deg spot-turn switch
+      spot_turn_enter_deg: 20.0
+      spot_turn_exit_deg: 10.0
+      course_min_speed: 0.3
+      rate_speed_floor: 0.5
+      align_enter_deg: 45.0
+      align_exit_deg: 12.0
+      align_speed_max: 0.5
+      align_speed: 0.0               # PX4 turns the rover on the spot
+      # PX4 parameters the rollout plant needs (airframe 2010) and its fitted response
+      px4_yaw_rate_lim_deg: 120.0    # RO_YAW_RATE_LIM
+      max_thr_speed: 2.7             # RO_MAX_THR_SPEED
+      max_thr_yaw_r: 2.7             # RD_MAX_THR_YAW_R
+      track: 1.4                     # RD_WHEEL_TRACK (effective, skid steering)
+      model_tau_speed: 0.5           # fitted speed response [s] (fit_ground_model.py --drive-only, h_move_cur)

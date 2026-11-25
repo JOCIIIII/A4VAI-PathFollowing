@@ -265,12 +265,20 @@ __device__ void vtp_decision_(
     float vt[3]
 )
 {
+#ifdef GROUND_VEHICLE
+    // ground / surface vehicle: the target is always virtual_target_distance AHEAD of the closest point
+    // along the path, never the closest point itself (as core_pathfollowing._vtp_decision with a
+    // ground config): a nonholonomic vehicle cannot move to the path sideways
+    (void)dist_to_path;
+    float total_len = 0.0f;
+#else
     if (dist_to_path >= virtual_target_distance) {
         copy3_(closest_on_path, vt);
         return;
     }
 
     float total_len = dist_to_path;
+#endif
     float p1[3];
     copy3_(closest_on_path, p1);
 
@@ -438,6 +446,16 @@ __device__ void guidance_modules_(
             kp_pos * pos_error_ned[1],
             kp_pos * pos_error_ned[2]
         };
+#ifdef GROUND_VEHICLE
+        // ground / surface vehicle: the PF's speed-regulated pursuit (pos_speed_mode) - toward the
+        // target at the step's speed reference (corner / end braking already applied)
+        {
+            float dist = norm3_(pos_error_ned);
+            if (dist > EPS_NORM) {
+                for (int i = 0; i < 3; ++i) vel_cmd_ned[i] = pos_error_ned[i] * (desired_speed / dist);
+            }
+        }
+#endif
         float vel_error_ned[3] = {
             vel_cmd_ned[0] - vel[0],
             vel_cmd_ned[1] - vel[1],
@@ -714,6 +732,90 @@ __device__ void update_states_(
     matvec3_(cB_I, vb, vi);
 }
 
+#ifdef GROUND_VEHICLE
+// Ground (UGV) / surface (USV) vehicle under PX4 rover_differential with an offboard velocity setpoint.
+// Output stage = core_pathfollowing._convert_acc_cmd_to_ground_cmd (acceleration -> speed + bearing,
+// turn toward the target on the spot first when slow and far off it). PX4 = spot turn beyond the
+// switch angle; yaw P -> yaw-rate setpoint (limited) -> yaw rate (first order, accel limited); speed
+// (first order, accel / decel limited) capped by the wheel / thruster differential the turn leaves.
+// Kinematic unicycle: the velocity points along the yaw. GND_* come from the vehicle yaml's "ground"
+// section (core_mppi._ground_defines); the response time constants were fitted to step tests
+// (scripts/dev/ground/fit_ground_model.py).
+__device__ void ground_step_(
+    const float acc_cmd[3],
+    const float vt[3],
+    float pos[3],
+    float vel[3],
+    float att[3],
+    float* speed,
+    float* v_lat,
+    float* yaw_rate,
+    int* align,
+    int* spot,
+    float dt
+)
+{
+    float yaw = att[2];
+    float v = *speed;                       // surge (forward) speed, what PX4's speed loop controls
+    // output stage, as core_pathfollowing._convert_acc_cmd_to_ground_cmd: accelerations split along / across
+    // the direction of travel (the course; the yaw when slow), turn rate = lateral acceleration / speed
+    float mag = norm_xy_(vel);
+    float course = (mag > GND_COURSE_MIN_SPEED) ? atan2f(vel[1], vel[0]) : yaw;
+    float cc = cosf(course), sc = sinf(course);
+    float acc_t = acc_cmd[0] * cc + acc_cmd[1] * sc;
+    float acc_n = -acc_cmd[0] * sc + acc_cmd[1] * cc;
+    float r_cmd = clamp_(acc_n / fmaxf(mag, GND_RATE_SPEED_FLOOR), -GND_YAW_RATE_MAX, GND_YAW_RATE_MAX);
+    float bearing = yaw + clamp_(r_cmd / GND_YAW_KP, -GND_LEAD_MAX, GND_LEAD_MAX);
+    float v_cmd = v + acc_t * GND_TAU_SPEED_CMD;
+    float az_t = atan2f(vt[1] - pos[1], vt[0] - pos[0]);
+    float err_t = fabsf(wrap_pi_(az_t - yaw));
+    if (*align) {
+        if (err_t < GND_ALIGN_EXIT) *align = 0;
+    } else if (v < GND_ALIGN_SPEED_MAX && err_t > GND_ALIGN_ENTER) {
+        *align = 1;
+    }
+    if (*align) {
+        bearing = az_t;
+        v_cmd = GND_ALIGN_SPEED;
+    }
+    v_cmd = clamp_(v_cmd, 0.0f, GND_SPEED_MAX);
+
+    float herr = wrap_pi_(bearing - yaw);
+    if (*spot) {
+        if (fabsf(herr) < GND_SPOT_EXIT) *spot = 0;
+    } else if (fabsf(herr) > GND_SPOT_ENTER) {
+        *spot = 1;
+    }
+    float r_sp = clamp_(GND_YAW_KP * herr, -GND_PX4_YAW_RATE_LIM, GND_PX4_YAW_RATE_LIM);
+    if (*spot) {
+        v_cmd = 0.0f;
+    } else {
+        v_cmd = fminf(v_cmd, GND_MAX_THR_SPEED * fmaxf(1.0f - fabsf(r_sp) * GND_TRACK_HALF / GND_MAX_THR_YAW_R, 0.0f));
+    }
+    v = fmaxf(v + clamp_((v_cmd - v) / GND_TAU_SPEED, -GND_DECEL_MAX, GND_ACCEL_MAX) * dt, 0.0f);
+    *yaw_rate += clamp_((r_sp - *yaw_rate) / GND_TAU_YAW_RATE, -GND_YAW_ACCEL_MAX, GND_YAW_ACCEL_MAX) * dt;
+    yaw = wrap_pi_(yaw + *yaw_rate * dt);
+#ifdef GND_SWAY_TAU
+    // sway (surface vessel): v_lat' = -v_lat / tau - u r (body frame); the hull slides outward in turns
+    // (the boat model: ~20 deg of drift at 2.5 m/s on a 15 m circle; tau fitted to its logs)
+    *v_lat += (-(*v_lat) / GND_SWAY_TAU - v * (*yaw_rate)) * dt;
+#endif
+    float cy = cosf(yaw), sy = sinf(yaw);
+    float vl = *v_lat;
+    pos[0] += (v * cy - vl * sy) * dt;
+    pos[1] += (v * sy + vl * cy) * dt;
+    pos[2] = 0.0f;
+    float vv = fmaxf(v, 1.0e-3f);   // the guidance takes the direction of travel from vel
+    vel[0] = vv * cy - vl * sy;
+    vel[1] = vv * sy + vl * cy;
+    vel[2] = 0.0f;
+    att[0] = 0.0f;
+    att[1] = 0.0f;
+    att[2] = yaw;
+    *speed = v;
+}
+#endif
+
 __device__ void cost_function_1_(
     const float r[3],
     const float mppi_ctrl_input[2],
@@ -967,6 +1069,20 @@ extern "C" __global__ void mppi_rollout_kernel(
 
     int final_wp_idx_passed = wp_idx_passed;
     float final_closest[3] = {0.0, 0.0, 0.0};
+#ifdef GROUND_VEHICLE
+    // forward speed, yaw rate (the PF sends it in the thrust slot), the align / spot-turn latches
+    // surge / sway split of the initial velocity (the PF sends the measured velocity for a course-frame
+    // vehicle, the velocity projected on the heading for a heading-frame one)
+    float g_speed = fmaxf(vel[0] * cosf(att[2]) + vel[1] * sinf(att[2]), 0.0f);
+#ifdef GND_SWAY_TAU
+    float g_vlat = -vel[0] * sinf(att[2]) + vel[1] * cosf(att[2]);
+#else
+    float g_vlat = 0.0f;
+#endif
+    float g_rate = t_cmd;
+    int g_align = 0;
+    int g_spot = 0;
+#endif
 
     for (int i_n = 0; i_n < N; ++i_n) {
         float disturbance_acc_est[3] = {
@@ -1035,6 +1151,7 @@ extern "C" __global__ void mppi_rollout_kernel(
             acc_cmd
         );
 
+#ifndef GROUND_VEHICLE
         float disturbance_acc[3] = {
             disturbance_acc_est[0],
             disturbance_acc_est[1],
@@ -1065,6 +1182,7 @@ extern "C" __global__ void mppi_rollout_kernel(
             att_cmd
         );
 
+#endif
         float mag_v = norm_xy_(vel);
         float weight_by_var = disturbance_var_weight_gain * fminf(disturbance_acc_var, disturbance_var_clip);
         float cost_arr[3] = {0.0, 0.0, 0.0};
@@ -1102,6 +1220,11 @@ extern "C" __global__ void mppi_rollout_kernel(
 
         total_cost += cost_arr[0] + cost_arr[1] + cost_arr[2];
 
+#ifdef GROUND_VEHICLE
+        float vel_prev[3] = {vel[0], vel[1], vel[2]};
+        ground_step_(acc_cmd, vt, pos, vel, att, &g_speed, &g_vlat, &g_rate, &g_align, &g_spot, dt);
+        (void)disturbance_acc_var;
+#else
         t_cmd = t_cmd + (t_cmd_ref - t_cmd) / tau_throttle * dt;
         t_cmd = clamp_(t_cmd, 0.0, t_max);
 
@@ -1164,6 +1287,7 @@ extern "C" __global__ void mppi_rollout_kernel(
             cB_I,
             vel
         );
+#endif
 
         acc[0] = (vel[0] - vel_prev[0]) / fmaxf(dt, EPS_DIV);
         acc[1] = (vel[1] - vel_prev[1]) / fmaxf(dt, EPS_DIV);

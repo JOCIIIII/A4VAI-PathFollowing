@@ -61,6 +61,8 @@ class Logger:
                 "closest_x", "closest_y", "closest_z",
                 "ndo_x", "ndo_y", "ndo_z",
                 "speed_ref", "lookahead",
+                # ground / surface vehicle output (NaN on a multicopter)
+                "gnd_speed_cmd", "gnd_bearing_cmd", "gnd_yaw_rate_cmd", "gnd_acc_t", "gnd_acc_n", "gnd_align",
             ])
 
     def update(
@@ -101,6 +103,7 @@ class Logger:
         ndo=None,
         speed_ref: float = float("nan"),
         lookahead: float = float("nan"),
+        ground=None,
     ) -> None:
         def _vec3(vec):
             if vec is None:
@@ -151,6 +154,7 @@ class Logger:
                 cp_x, cp_y, cp_z,
                 ndo_x, ndo_y, ndo_z,
                 speed_ref, lookahead,
+                *([float("nan")] * 6 if ground is None else [float(v) for v in ground]),
             ])
 
 

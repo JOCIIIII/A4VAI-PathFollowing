@@ -30,6 +30,11 @@ CORNER_FLOAT_PARAMS = (
 )
 
 
+# vehicle_type -> vehicle yaml (as node_pathfollowing): 3 / 4 = ground / surface vehicle, whose yaml has a
+# "ground" section that compiles the rollout kernel with the rover plant (mppi_kernel.cu GROUND_VEHICLE)
+VEHICLE_YAML = {1: 'quad.yaml', 2: 'octo.yaml', 3: 'ugv.yaml', 4: 'usv.yaml'}
+
+
 class NodeMPPI(Node):
     def __init__(self):
         super().__init__('node_mppi')
@@ -42,7 +47,7 @@ class NodeMPPI(Node):
 
         vehicle_type = self._require_int(
             'vehicle_type',
-            allowed={1, 2},
+            allowed=set(VEHICLE_YAML),
             default=sim_cfg.get('vehicle_type'),
         )
         guid_type = self._require_int(
@@ -50,7 +55,7 @@ class NodeMPPI(Node):
             allowed={0, 1, 2},
             default=sim_cfg.get('guid_type'),
         )
-        vehicle_yaml = 'quad.yaml' if vehicle_type == 1 else 'octo.yaml'
+        vehicle_yaml = VEHICLE_YAML[vehicle_type]
         vehicle_cfg = self._load_yaml(vehicle_yaml)
         # the sim yaml may override vehicle-model entries per vehicle file (sim_ca_mppi.yaml: the
         # MPPI rollout's attitude time constants): {quad|octo: {section: {key: value}}}
